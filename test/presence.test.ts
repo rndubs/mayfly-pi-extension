@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { browserCommand, introMessage, osc8, parseIntro, reachability, splitTaskArg, statusLabel, taskUpdateMessage } from "../presence.ts";
+import { browserCommand, introMessage, openHint, osc8, parseIntro, reachability, splitTaskArg, statusLabel, statusLine, taskUpdateMessage } from "../presence.ts";
 import { mergeProfile } from "../profile.ts";
 
 test("introMessage: name, task, and how to reach the agent", () => {
@@ -44,6 +44,19 @@ test("statusLabel", () => {
   assert.equal(statusLabel({ ...base, unseen: 3 }), "mayfly: A · addressed · 3 unseen");
   assert.equal(statusLabel({ ...base, unseen: 3, addressed: 1 }), "mayfly: A · addressed · 1 for you");
   assert.equal(statusLabel({ ...base, paused: true, reconnecting: true }), "mayfly: A · addressed · ⏸ paused · ⚠ reconnecting");
+});
+
+test("statusLine: one link, name underlined with ↗ so it reads as clickable; the key is not visible", () => {
+  const base = { name: "A", wake: "addressed" as const, unseen: 2, addressed: 0, paused: false, reconnecting: false };
+  const s = statusLine("https://h/c/ID#secretkey", base);
+  assert.equal(s, "💬 \x1b]8;;https://h/c/ID#secretkey\x1b\\\x1b[4mmayfly: A\x1b[24m ↗ · addressed · 2 unseen\x1b]8;;\x1b\\");
+  const visible = s.replace(/\x1b\]8;;[^\x1b]*\x1b\\/g, "").replace(/\x1b\[\d+m/g, "");
+  assert.equal(visible, "💬 mayfly: A ↗ · addressed · 2 unseen");
+});
+
+test("openHint names the platform's click modifier and /mayfly open", () => {
+  assert.match(openHint("darwin"), /^Cmd-click .*\/mayfly open/);
+  assert.match(openHint("linux"), /^Ctrl-click /);
 });
 
 test("browserCommand per platform", () => {

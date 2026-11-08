@@ -72,6 +72,21 @@ export function statusLabel(s: StatusInput): string {
   return parts.join(" · ");
 }
 
+/**
+ * The footer status: "💬 mayfly: <name> ↗ · <wake> · …", all one OSC 8 link to the chat. "mayfly: <name>" is
+ * underlined and followed by ↗ so it reads as clickable (the URL itself, with its #key, is never printed).
+ */
+export function statusLine(url: string, s: StatusInput): string {
+  const head = `mayfly: ${s.name}`;
+  const rest = statusLabel(s).slice(head.length); // " · addressed · …"
+  return "💬 " + osc8(url, `\x1b[4m${head}\x1b[24m ↗${rest}`);
+}
+
+/** How to open the chat in a browser, for notifications and status. */
+export function openHint(platform: NodeJS.Platform = process.platform): string {
+  return `${platform === "darwin" ? "Cmd" : "Ctrl"}-click "💬 mayfly" in the footer, or run /mayfly open, to open the chat in your browser.`;
+}
+
 /** Command to open a URL in the default browser on this platform. */
 export function browserCommand(url: string, platform: NodeJS.Platform = process.platform): { cmd: string; args: string[] } {
   if (platform === "darwin") return { cmd: "open", args: [url] };
