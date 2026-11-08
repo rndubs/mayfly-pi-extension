@@ -1,0 +1,6 @@
+{
+  "description": "Follow the whole conversation: wake on every message from others (the 0.2 behavior). Tighter budget.",
+  "wake": "all",
+  "context": { "recentK": 20 },
+  "budget": { "burst": 4, "refillPerMinute": 0.5, "hourlyCap": 20 }
+}

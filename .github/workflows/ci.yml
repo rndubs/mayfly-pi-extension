@@ -40,3 +40,40 @@ jobs:
 
       - name: Smoke test (load built extension in real pi)
         run: scripts/smoke.sh _dist/index.js "$(pwd)/node_modules/.bin/pi"
+
+  integration:
+    name: integration (local Mayfly server @ ${{ matrix.mayfly }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Pinned Mayfly server commit (github.com/josharian/mayfly main as of 2026-11-07).
+        mayfly: ["06dd34e918f651e1a8b86531bd3ef1815a4d6a4e"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out the Mayfly server source
+        uses: actions/checkout@v7
+        with:
+          repository: josharian/mayfly
+          ref: ${{ matrix.mayfly }}
+          path: _mayfly
+          persist-credentials: false
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: _mayfly/go.mod
+          cache-dependency-path: _mayfly/go.sum
+
+      - name: Build the Mayfly server
+        working-directory: _mayfly
+        run: go build -o "$RUNNER_TEMP/mayfly" ./cmd/mayfly
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - name: Integration tests (core against a real server)
+        env:
+          MAYFLY_SERVER_BIN: ${{ runner.temp }}/mayfly
+          MAYFLY_REQUIRE_SERVER: "1"
+        run: npm run test:integration
