@@ -11,7 +11,7 @@
     ]
   },
   "scripts": {
-    "test": "node --test test/",
+    "test": "node --test \"test/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "smoke": "scripts/smoke.sh dist/index.js"
