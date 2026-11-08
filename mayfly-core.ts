@@ -6,7 +6,7 @@
 // Owns: crypto, transport, the cursor, dedup, "skip our own `from`", 409 handling.
 // Does NOT own: Pi wiring, AbortControllers for the session, UI. See index.ts.
 
-import { createCipheriv, createDecipheriv, hkdfSync, randomBytes } from "node:crypto";
+import { createCipheriv, createDecipheriv, createHash, hkdfSync, randomBytes } from "node:crypto";
 
 export interface MayflyMessage {
   seq: number;
@@ -82,9 +82,11 @@ export interface Channel {
   name: string;
   /** Highest seq delivered to the model (via watch or post). -1 before anything. */
   readonly last: number;
+  /** Seqs of messages this client posted (this session, plus any learned via history()). Used for `/re N` addressing. */
+  readonly ownSeqs: ReadonlySet<number>;
   post(text: string, opts?: { replyTo?: number }): Promise<PostResult>;
   react(seq: number, emoji: string): Promise<PostResult>;
-  /** Last n messages (all senders, including us). Does not move the cursor. */
+  /** Last n messages (all senders, including us). Does not move the cursor; records our own seqs. */
   history(n: number): Promise<MayflyMessage[]>;
   /**
    * Long-poll loop. Calls onBatch once per poll with undelivered messages not from us.
@@ -182,6 +184,12 @@ export function openChannel(url: string, name: string): Channel {
   let delivered = -1; // highest seq handed to the model
   let head = -1; // highest seq known to exist (cursor for posting)
   let primed = false; // has the initial cursor been established?
+  const mine = new Set<number>(); // seqs we posted (bounded; oldest pruned)
+  const OWN_MAX = 2000;
+  function addMine(seq: number) {
+    mine.add(seq);
+    if (mine.size > OWN_MAX) mine.delete(mine.values().next().value as number);
+  }
 
   const seal = (seq: number, message: { from: string; text: string }) => sealMessage(keys, seq, message);
   const open = (ev: any) => openEvent(keys, ev);
@@ -281,6 +289,7 @@ export function openChannel(url: string, name: string): Channel {
       }
       // Our own post is seq=json.id; mark it known. Events are replies after it.
       if (typeof json.id === "number" && json.id > head) head = json.id;
+      if (typeof json.id === "number") addMine(json.id);
       return { posted: true, id: json.id, newMessages: ingest(json.events, json.last) };
     } catch (e: any) {
       if (e instanceof MayflyFatalError) throw e;
@@ -303,6 +312,7 @@ export function openChannel(url: string, name: string): Channel {
     get last() {
       return delivered;
     },
+    ownSeqs: mine,
 
     post(text, opts) {
       const prefix = opts?.replyTo !== undefined ? `/re ${opts.replyTo} ` : "";
@@ -320,7 +330,9 @@ export function openChannel(url: string, name: string): Channel {
       const top: number = probe.json.last;
       if (top > head) head = top;
       const { events } = await drain(Math.max(-1, top - count));
-      return events.map(open);
+      const msgs = events.map(open);
+      for (const m of msgs) if (m.from === channel.name) addMine(m.seq);
+      return msgs;
     },
 
     async watch(onBatch, signal, opts) {
@@ -353,4 +365,64 @@ export function openChannel(url: string, name: string): Channel {
 /** Compact plain-text rendering for injecting into the model's context. */
 export function formatMessages(msgs: MayflyMessage[]): string {
   return msgs.map((m) => `[#${m.seq} ${m.from || "?"}] ${m.text.replace(/\s+$/, "")}`).join("\n");
+}
+
+/** Validate a bare http(s) origin (no path, query, or fragment). */
+function parseOrigin(origin: string): URL {
+  let u: URL;
+  try {
+    u = new URL(origin.trim().replace(/^['"<`]+|['">`]+$/g, ""));
+  } catch {
+    throw new Error("expected an http(s) origin such as https://mayfly.chat");
+  }
+  if (!/^https?:$/.test(u.protocol) || u.username || u.password || u.search || u.hash || (u.pathname !== "/" && u.pathname !== ""))
+    throw new Error("expected an http(s) origin with no path, query, or fragment, such as https://mayfly.chat");
+  return u;
+}
+
+export interface CreatedChannel {
+  /** Full URL including the secret #key. Share only with intended participants. */
+  url: string;
+  /** Origin + /c/ID with no key — safe to display/log. */
+  redactedUrl: string;
+  id: string;
+}
+
+/**
+ * Create a new empty channel (protocol.md "POST /new"): 32 random key bytes, derive id/auth, send
+ * {id, auth_hash: b64url(sha256(auth))}, expect 303. The key never leaves this process.
+ */
+export async function createChannel(origin = "https://mayfly.chat", signal?: AbortSignal): Promise<CreatedChannel> {
+  const u = parseOrigin(origin);
+  const key = randomBytes(32);
+  const { id, auth } = deriveKeys(key);
+  const body = JSON.stringify({ id, auth_hash: b64(createHash("sha256").update(auth, "utf8").digest()) });
+  const res = await fetch(new URL("/new", u), {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+    redirect: "manual",
+    signal: signal ?? AbortSignal.timeout(60_000),
+  });
+  const raw = await res.text().catch(() => "");
+  if (res.status !== 303) {
+    let detail = raw.slice(0, 200).trim();
+    try {
+      detail = JSON.parse(raw)?.error ?? detail;
+    } catch {}
+    if (res.status === 429) throw new Error("channel creation rate limit reached on this server; try again later");
+    throw new Error(`channel creation failed: HTTP ${res.status}${detail ? ` (${detail})` : ""}`);
+  }
+  const redactedUrl = `${u.origin}/c/${id}`;
+  return { url: `${redactedUrl}#${b64(key)}`, redactedUrl, id };
+}
+
+/** Permanently delete a channel (DELETE /c/ID with the derived bearer). Used by tests; not exposed as a tool. */
+export async function deleteChannel(url: string): Promise<void> {
+  const m = /^(https?:\/\/[^\s\\/?#@\x00-\x1f]+)\/c\/([A-Za-z0-9_-]+)#(.+)$/i.exec(url.trim());
+  if (!m) throw new Error("expected a full Mayfly URL: https://host/c/ID#key");
+  const keys = deriveKeys(unb64(m[3]));
+  if (keys.id !== m[2]) throw new Error("URL path does not match its #key");
+  const res = await fetch(`${m[1]}/c/${keys.id}`, { method: "DELETE", headers: { Authorization: `Bearer ${keys.auth}` } });
+  if (res.status !== 204) throw new Error(`delete failed: HTTP ${res.status}`);
 }

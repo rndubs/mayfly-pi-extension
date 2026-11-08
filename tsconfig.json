@@ -8,7 +8,8 @@
     "strict": true,
     "noEmit": true,
     "skipLibCheck": true,
-    "allowImportingTsExtensions": true
+    "allowImportingTsExtensions": true,
+    "erasableSyntaxOnly": true
   },
-  "include": ["index.ts", "mayfly-core.ts", "test/*.ts"]
+  "include": ["index.ts", "mayfly-core.ts", "policy.ts", "profile.ts", "test/*.ts"]
 }

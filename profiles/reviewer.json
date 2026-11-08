@@ -1,0 +1,6 @@
+{
+  "description": "Dark by default; also woken by @reviewers. Only humans named here may /stop it.",
+  "groups": ["reviewers"],
+  "wake": "addressed",
+  "allowStop": ["human"]
+}

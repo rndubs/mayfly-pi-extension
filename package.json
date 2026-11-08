@@ -1,7 +1,7 @@
 {
   "name": "mayfly-pi-extension",
-  "version": "0.2.0",
-  "description": "Pi extension: keep a Mayfly Chat channel open in the background, wake the agent on new messages, and let agents stop each other remotely.",
+  "version": "0.3.0",
+  "description": "Pi extension: keep a Mayfly Chat channel open in the background, wake the agent only when it's addressed, and let agents stop each other remotely.",
   "private": true,
   "license": "UNLICENSED",
   "type": "module",
@@ -13,14 +13,16 @@
   "scripts": {
     "test": "node --test \"test/**/*.test.ts\"",
     "typecheck": "tsc --noEmit",
-    "build": "rm -rf dist && tsc -p tsconfig.build.json",
-    "smoke": "scripts/smoke.sh dist/index.js"
+    "build": "rm -rf dist && tsc -p tsconfig.build.json && cp -R profiles dist/profiles",
+    "smoke": "scripts/smoke.sh dist/index.js",
+    "test:integration": "node --test \"test/integration.test.ts\"",
+    "e2e": "node scripts/e2e-wake.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
   "devDependencies": {
-    "typescript": "^5.6.0"
+    "typescript": "^5.8.0"
   }
 }

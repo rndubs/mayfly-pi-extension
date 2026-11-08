@@ -12,6 +12,6 @@ out="$( (printf '%s\n' '{"type":"get_commands"}' '{"type":"prompt","message":"/m
 fail() { echo "SMOKE FAIL: $1"; echo "--- pi output ---"; echo "$out" | cut -c1-400; exit 1; }
 echo "$out" | grep -q "\"name\":\"mayfly\"" || fail "/mayfly command not registered"
 echo "$out" | grep -qF "\"path\":\"$ext\"" || fail "/mayfly not loaded from $ext"
-echo "$out" | grep -q "Mayfly: not watching any channel" || fail "/mayfly status handler did not run"
+echo "$out" | grep -q "Mayfly: Not watching any Mayfly channel" || fail "/mayfly status handler did not run"
 if echo "$out" | grep -qi "extension_error\|failed to load\|Cannot find module"; then fail "extension load error"; fi
 echo "SMOKE OK: /mayfly registered from $ext and handler ran"

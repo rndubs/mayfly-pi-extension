@@ -8,7 +8,7 @@ if (!out) throw new Error("usage: assemble-dist.mjs <outDir>");
 rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
 
-for (const f of readdirSync("dist")) cpSync(join("dist", f), join(out, f));
+for (const f of readdirSync("dist")) cpSync(join("dist", f), join(out, f), { recursive: true });
 for (const f of ["README.md", "CHANGELOG.md", "THIRD_PARTY_NOTICES.md"]) cpSync(f, join(out, f));
 
 const pkg = JSON.parse(readFileSync("package.json", "utf8"));
