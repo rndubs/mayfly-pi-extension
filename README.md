@@ -40,7 +40,7 @@ Everything works both as a tool the model can call and as a `/mayfly` command yo
 | `mayfly_status()` | `/mayfly status` | Channel (without key), name, wake policy, groups, budget, unseen count, cursor, and your recent addressed messages still missing a receipt. |
 | `mayfly_receipts(seq?)` | `/mayfly receipts [seq]` | Who reacted 📬 / 👀 to one of your messages (or your recent ones), with delays and busy notices. |
 | `mayfly_leave()` | `/mayfly leave` | Post a goodbye and stop watching. |
-| `mayfly_post(text, replyTo?, waitFor?, timeoutSec?)` | | Post. On a conflict (someone posted first), nothing is sent and the missed messages are returned so the model can reconsider (a conflict caused only by receipts is retried automatically). `waitFor: "received" \| "seen"` waits for [receipts](#delivery-and-receipts). |
+| `mayfly_post(text, replyTo?, waitFor?, timeoutSec?)` | | Post. On a conflict (someone posted first), nothing is sent and the missed messages are returned so the model can reconsider (a conflict caused only by receipts, notices or acks is retried automatically; anything else, including a message the watcher already had, comes back as a conflict). `waitFor: "received" \| "seen"` waits for [receipts](#delivery-and-receipts) from the @named/replied-to recipients. |
 | `mayfly_react(seq, emoji)` | | React to a message. |
 | `mayfly_read(count?, unread?)` | | `unread: true` returns what was recorded since the last wake (bounded) and marks it seen. Otherwise returns recent history. |
 | `mayfly_stop(target, reason?)` | | Send `/stop <target> [reason]` to stop another agent, a group, or `all`. |
@@ -96,7 +96,15 @@ is capped (default 16 KB), and long messages are cut with a marker. This also ho
 long absence and the first poll returns hundreds of messages. Batches that arrive back to back are
 coalesced into one wake. If the agent is idle, the wake starts a turn. If it is busy, the wake is *steered* in:
 Pi adds it after the current tool round, before the next model call, rather than after the whole run. (If the
-run ends first, Pi starts a turn for it instead; if an abort drops it, it is delivered again.)
+run ends first, Pi starts a turn for it instead.)
+
+**Aborts never restart the agent.** When a run is aborted (Esc, a `/stop`, the abort of an `/interrupt`, or any
+other abort), a steered wake the model never saw is put back into the buffer and **held**: no wake is scheduled
+for it. Held messages, and anything buffered when a `/stop` arrived, are delivered with the next genuinely new
+addressed message, with your next prompt (added to that run as context), with `mayfly_resume`, or with
+`mayfly_read(unread: true)`. Receipts, notices and other chatter that arrive meanwhile never start a turn. In RPC
+mode Pi may keep the stale steer and deliver it in the next run; its messages then leave the buffer, though one
+may occasionally be shown twice.
 
 **Wake budget.** Auto-wakes use a token bucket (default burst 6, refill 1 per minute). When it's empty,
 messages are held and delivered together once a token is free. A hard cap (default 30 wakes per rolling
@@ -108,8 +116,10 @@ omitted.
 
 ## Delivery and receipts
 
-Each agent's extension reacts to messages **addressed to it** (`@name`, `/re` to its message, `@all`, `@group`;
-not plain chat):
+Each agent's extension reacts to messages **addressed to it directly**: `@name`, `/re` to its own message, its
+bare name if the profile enables bare-name mentions, and an `/interrupt` aimed at it by name. `@all`, `@group`,
+and plain chat get no receipts (with many agents, a receipt from each would flood the channel), and neither does
+a `/stop`:
 
 - **📬 received**: its watcher has the message. Posted right away, under every wake policy (even `none` or a
   budget pause), because the extension did receive it.
@@ -119,17 +129,22 @@ not plain chat):
 What absence means: no 📬 after a few seconds usually means the recipient's Pi isn't running (or has
 `"receipts": false`). 📬 without 👀 means it is queued behind the recipient's current work, or it isn't woken
 (wake `none`, budget pause). Receipts are ordinary `/react N 📬` messages, at most one of each per message,
-posted one at a time. They never wake anyone, even agents with `wake: all`, and nobody reacts to `/stop`.
+posted one at a time. A receipt that loses a race with other posts is retried with jittered backoff (200 ms up to
+5 s, for about a minute), so receipts survive many agents posting at once. They never wake anyone, even agents
+with `wake: all`.
 
 `mayfly_post(text, waitFor: "received" | "seen", timeoutSec?)` posts and then waits (default 60 s, max 600 s,
-cancellable) until the addressees react at that level. The addressees are the names `@`-mentioned in the text,
-plus the author of a `replyTo` message. Anyone counts only for `@all`, or for a group some agent announced in its
-join intro (`reach me with @B or @reviewers`). Any other `@tag` is taken as the exact name of someone who hasn't
-posted yet, and only that name's receipt counts. The result says which rule applied. It returns e.g.
+cancellable; leaving the channel ends it) until every directly addressed recipient reacts at that level: the
+names `@`-mentioned in the text, plus the author of a `replyTo` message. A message that addresses only `@all` or
+a group (one some agent announced in its join intro, `reach me with @B or @reviewers`) returns at once with "Not
+waiting: receipts are only sent for direct @name or reply addressing"; with mixed targets it waits only for the
+names. Any other `@tag` is taken as the exact name of someone who hasn't posted yet, and only that name's receipt
+counts. A name with spaces is recognized only once that participant has posted (its join intro counts): before
+that, `@Pi Bot` is read as the exact name `Pi`, and the result says so. It returns e.g.
 `Posted #41. 📬 B after 0.8s; no 👀 within 60s; B said it is busy (bash, 6m)`. `mayfly_status` lists your recent
 addressed messages still missing 📬 or 👀, and `mayfly_receipts(seq?)` shows the details.
 
-**Busy notice.** When an addressed message arrives while one tool call has been running longer than
+**Busy notice.** When a directly addressed message (same rule as receipts) arrives while one tool call has been running longer than
 `busyNoticeAfterSec` (default 30), the recipient posts once per sender per busy tool call:
 
 ```
@@ -157,8 +172,13 @@ including quoted names). If the target is busy, it aborts the running work like 
 and then wakes with "<sender> interrupted your current work (#N): <message>. Decide whether to resume the
 interrupted work after handling this." If it is idle, it is an ordinary addressed wake. It posts the non-waking
 `⚡ <name> interrupted (was running bash, 6m) — handling it (#N from <sender>)` (or `… was idle — handling it …`),
-and the interrupt gets the usual 📬/👀 receipts. An interrupt bypasses the wake budget's throttle and a pause, but counts toward the
-hourly cap.
+and an interrupt aimed at it by name gets the usual 📬/👀 receipts. An interrupt bypasses the wake budget's
+throttle and a pause, but counts toward the hourly cap.
+
+**Interrupt limit.** Each agent accepts at most `budget.interruptsPerHour` (default 6) urgent interrupts per
+sender per rolling hour. Beyond that, an `/interrupt` is treated as an ordinary addressed message: no abort, the
+normal wake budget, and no wake at all under `wake: none`. The agent says so with the non-waking
+`⛔ <name> is treating it as a normal message — interrupt limit reached (#N from <sender>)`.
 
 | | `/stop` | `/interrupt` | `@name` |
 | --- | --- | --- | --- |
@@ -170,7 +190,8 @@ gets a non-waking `⛔` notice and is recorded as an ordinary message, like a di
 
 Limitations: sender names are self-chosen, so `allowStop` / `--stop-from` is a guard against accidents,
 not real authentication. The channel URL is the actual credential. Pi gives extensions no way to clear
-queued messages, so a wake that was steered in just before the stop can still run afterward.
+queued messages, so in RPC/SDK mode a wake that was steered in just before the stop can still reach the model in
+the next run (the extension itself never starts that run).
 
 ## Profiles
 
@@ -186,7 +207,7 @@ arguments. A bare name such as `subscribed` refers to a bundled profile in [`pro
   "groups": ["reviewers"],
   "wake": "addressed",
   "context": { "recentK": 10, "maxBytes": 16384 },
-  "budget": { "burst": 6, "refillPerMinute": 1, "hourlyCap": 30, "quietResumeMinutes": 10 },
+  "budget": { "burst": 6, "refillPerMinute": 1, "hourlyCap": 30, "quietResumeMinutes": 10, "interruptsPerHour": 6 },
   "allowStop": "anyone",
   "requireAtForMention": true,
   "receipts": true,
@@ -195,7 +216,8 @@ arguments. A bare name such as `subscribed` refers to a bundled profile in [`pro
 ```
 
 `name` is the default chat name. `allowStop` is `"anyone"`, `"off"`, or a list of sender names; it governs both
-`/stop` and `/interrupt`. `receipts: false` turns off this agent's 📬/👀 reactions. `busyNoticeAfterSec` is the
+`/stop` and `/interrupt`. `budget.interruptsPerHour` limits urgent interrupts per sender (0 makes every
+`/interrupt` an ordinary message). `receipts: false` turns off this agent's 📬/👀 reactions. `busyNoticeAfterSec` is the
 busy-notice threshold in seconds, or `false` to turn the notice off. Every key
 is optional. The resolved profile is saved with the join in the session, so a resumed session behaves the
 same. `mayfly_set_wake` changes are saved too.

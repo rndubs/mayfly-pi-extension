@@ -2,30 +2,44 @@
 
 ## 0.5.0 — unreleased
 
-- **Delivery receipts.** An agent reacts 📬 to each message addressed to it as soon as its watcher has it
-  (under every wake policy), and 👀 once the message is in its model's context (via the injected wake or
-  `mayfly_read`). At most one of each per message, posted through a queue; never for plain chat, its own
-  messages, or `/stop`. Receipts never wake anyone, even under `wake: all`. Opt out with `"receipts": false`.
+- **Delivery receipts.** An agent reacts 📬 to each message addressed to it **directly** (`@name`, `/re` to its
+  message, its bare name if enabled, an `/interrupt` aimed at it by name) as soon as its watcher has it (under
+  every wake policy), and 👀 once the message is in its model's context (via the injected wake or `mayfly_read`).
+  `@all`, `@group`, plain chat, its own messages and `/stop` get none. At most one of each per message, marked
+  done only once posted; a receipt that loses a race is retried with jittered backoff (200 ms → 5 s, up to about
+  a minute), so receipts survive many agents at once. Receipts never wake anyone, even under `wake: all`. Opt out
+  with `"receipts": false`.
 - **Waiting for receipts.** `mayfly_post` takes `waitFor: "received" | "seen"` and `timeoutSec` (default 60,
-  max 600) and reports e.g. `Posted #41. 📬 B after 0.8s; 👀 B after 34s`. `mayfly_status` lists recent
-  addressed messages still missing 📬 or 👀; new `mayfly_receipts(seq?)` / `/mayfly receipts [seq]`.
+  max 600) and reports e.g. `Posted #41. 📬 B after 0.8s; 👀 B after 34s`. It waits only for the directly
+  addressed names; a message to only `@all` or a group returns at once (no receipts are sent for those). Leaving
+  the channel ends a pending wait. `mayfly_status` lists recent messages still missing 📬 or 👀 from a named
+  recipient; new `mayfly_receipts(seq?)` / `/mayfly receipts [seq]`.
 - **Steer instead of follow-up.** A wake that arrives while the agent is busy is steered in after the current
-  tool round instead of waiting for the whole run to end. A steered wake dropped by an abort is delivered again.
-- **Busy notice.** An addressed message that arrives while one tool call has run longer than
+  tool round instead of waiting for the whole run to end.
+- **Aborts never restart the agent.** After any aborted run (Esc, `/stop`, an `/interrupt`'s abort), a steered
+  wake the model never saw is held, not redelivered: it comes with the next new addressed message, the user's
+  next prompt, `mayfly_resume`, or `mayfly_read unread`. A batch that brings nothing new and waking (e.g. a
+  receipt) never schedules a wake.
+- **Busy notice.** A directly addressed message that arrives while one tool call has run longer than
   `busyNoticeAfterSec` (default 30) gets one `⏳ <name> got #N but is busy (<tool>, running 6m)…` notice per
   sender per tool call.
 - **`/interrupt <target> <message>`** and `mayfly_interrupt`: urgent. A busy target aborts its work, then
   wakes with the message and decides whether to resume; an idle target gets an ordinary wake. Acknowledges with `⚡`.
-  Bypasses the wake throttle and a budget pause (counts toward the hourly cap). Governed by `allowStop`.
+  Bypasses the wake throttle and a budget pause (counts toward the hourly cap). Governed by `allowStop`, and
+  limited per sender by `budget.interruptsPerHour` (default 6); over the limit it is an ordinary addressed
+  message (no abort, normal budget, honors `wake: none`), announced with a non-waking `⛔` notice.
 - **Acks wake nobody.** The `⏹` (/stop), `⚡` (/interrupt) and `⛔` (not allowed) acknowledgements are plain text
-  naming the sender and `#N` (no `/re`, no `@`), and are ignored for waking even under `wake: all`. Use receipts
-  to learn whether an interrupt landed.
+  naming the sender and `#N` (no `/re`, no `@`), and are never treated as addressed (checked before mentions, so
+  also with `requireAtForMention: false`) or as waking, even under `wake: all`. Use receipts to learn whether an
+  interrupt landed.
 - **`waitFor` targets are exact.** An `@tag` that isn't a known participant or a known group is treated as the
   exact name of someone who hasn't posted yet: only their receipt counts. Groups are learned from other agents'
-  join intros. Only `@all` and known groups mean "anyone counts", and the result says which rule applied.
+  join intros. A name with spaces is recognized only after that participant has posted.
 - Posts the extension makes on its own (receipts, notices, replies, the intro) no longer swallow messages
-  from others that arrive in the same exchange; those now go through the normal wake path. A model post that
-  conflicts only with receipts is retried automatically.
+  from others that arrive in the same exchange; those now go through the normal wake path. A model post whose
+  conflict was caused only by automatic chatter (receipts, notices, acks) is retried automatically; the check
+  uses the raw conflicting events, so a real message the watcher had already delivered still comes back to the
+  model as a conflict, listed in the result. (mayfly-core: `PostResult.conflictEvents`.)
 
 ## 0.4.1 — 2026-11-07
 
