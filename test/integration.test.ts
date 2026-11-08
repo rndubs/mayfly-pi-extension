@@ -136,6 +136,38 @@ describe("core against a local Mayfly server", { skip }, () => {
     assert.deepEqual(hist.map((m) => m.text), ["y0", "x1", winText]);
   });
 
+  test("409 conflict: conflictEvents lists what raced the post, even if the watcher already delivered it", async () => {
+    const url = await newChan();
+    const x = open(url, "X");
+    const y = open(url, "Y");
+    await y.post("y0");
+    const w = watchInto(y);
+    await new Promise((r) => setTimeout(r, 200));
+    // Y's POST is in flight with a stale cursor while x1 lands and Y's watcher delivers it.
+    const realFetch = globalThis.fetch;
+    let delay = true;
+    globalThis.fetch = (async (u: any, init: any) => {
+      if (init?.method === "POST" && delay && String(u).includes("last=")) {
+        delay = false;
+        await w.until((g) => g.some((m) => m.text === "x1"));
+      }
+      return realFetch(u, init);
+    }) as any;
+    let r;
+    try {
+      const pending = y.post("y-stale");
+      await x.post("x1");
+      r = await pending;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    w.stop();
+    await w.done;
+    assert.equal(r.conflict, true);
+    assert.deepEqual(r.newMessages, [], "dedup keeps what the watcher delivered out of newMessages");
+    assert.deepEqual(r.conflictEvents!.map((m) => [m.from, m.text]), [["X", "x1"]]);
+  });
+
   test("resume via since replays only later messages; a fresh watcher starts at the head", async () => {
     const url = await newChan();
     const p = open(url, "Poster");

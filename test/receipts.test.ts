@@ -15,6 +15,8 @@ import {
   ReceiptTracker,
   resolveTargets,
   ackText,
+  backoffDelay,
+  noReceiptsExpected,
   parseAck,
 } from "../receipts.ts";
 
@@ -116,20 +118,20 @@ test("ReactionQueue: one 📬 and one 👀 per seq, sequential, 👀 supersedes 
   assert.equal(q.enqueue(9, "👀"), false, "remembered from history");
 });
 
-test("resolveTargets: @names (incl. spaces), /re author; only @all and known groups mean anyone", () => {
+test("resolveTargets: @names (incl. spaces), /re author; @all and known groups are broadcasts", () => {
   const known = ["A", "B", "Pi Bot", "Pi", "H"];
   const groups = ["reviewers"];
-  assert.deepEqual(resolveTargets("@B please check", known, "A"), { names: ["B"], anyone: false });
-  assert.deepEqual(resolveTargets("@Pi Bot and @B", known, "A"), { names: ["Pi Bot", "B"], anyone: false });
-  assert.deepEqual(resolveTargets("@Pi only", known, "A"), { names: ["Pi"], anyone: false });
-  assert.deepEqual(resolveTargets("@all status?", known, "A"), { names: [], anyone: true });
-  assert.deepEqual(resolveTargets("@reviewers look", known, "A", undefined, groups), { names: [], anyone: true, groups: ["reviewers"] });
-  assert.deepEqual(resolveTargets("@B and @reviewers", known, "A", undefined, groups), { names: ["B"], anyone: true, groups: ["reviewers"] });
+  assert.deepEqual(resolveTargets("@B please check", known, "A"), { names: ["B"], broadcast: false });
+  assert.deepEqual(resolveTargets("@Pi Bot and @B", known, "A"), { names: ["Pi Bot", "B"], broadcast: false });
+  assert.deepEqual(resolveTargets("@Pi only", known, "A"), { names: ["Pi"], broadcast: false });
+  assert.deepEqual(resolveTargets("@all status?", known, "A"), { names: [], broadcast: true });
+  assert.deepEqual(resolveTargets("@reviewers look", known, "A", undefined, groups), { names: [], broadcast: true, groups: ["reviewers"] });
+  assert.deepEqual(resolveTargets("@B and @reviewers", known, "A", undefined, groups), { names: ["B"], broadcast: true, groups: ["reviewers"] });
   // An @tag that is neither a known name nor a known group: wait for that exact name, not for anyone.
-  assert.deepEqual(resolveTargets("@Carol can you help", known, "A"), { names: ["Carol"], anyone: false, unseen: ["Carol"] });
-  assert.deepEqual(resolveTargets("@reviewers look", known, "A"), { names: ["reviewers"], anyone: false, unseen: ["reviewers"] });
-  assert.deepEqual(resolveTargets("@ALL hands", known, "A"), { names: [], anyone: true });
-  assert.deepEqual(resolveTargets("thanks", known, "A", "H"), { names: ["H"], anyone: false });
+  assert.deepEqual(resolveTargets("@Carol can you help", known, "A"), { names: ["Carol"], broadcast: false, unseen: ["Carol"] });
+  assert.deepEqual(resolveTargets("@reviewers look", known, "A"), { names: ["reviewers"], broadcast: false, unseen: ["reviewers"] });
+  assert.deepEqual(resolveTargets("@ALL hands", known, "A"), { names: [], broadcast: true });
+  assert.deepEqual(resolveTargets("thanks", known, "A", "H"), { names: ["H"], broadcast: false });
   assert.equal(resolveTargets("just chatting, mail b@B.com", known, "A"), null);
   assert.equal(resolveTargets("note to self @A", known, "A"), null);
 });
@@ -137,7 +139,7 @@ test("resolveTargets: @names (incl. spaces), /re author; only @all and known gro
 test("ReceiptTracker: which reactions count, per target", () => {
   let now = 1000;
   const t = new ReceiptTracker(200, () => now);
-  t.noteOwn(10, "@B @C do it", { names: ["B", "C"], anyone: false });
+  t.noteOwn(10, "@B @C do it", { names: ["B", "C"], broadcast: false });
   assert.equal(t.noteReaction("B", 10, "👍"), false, "other emoji ignored");
   now = 1800;
   t.noteReaction("B", 10, "📬");
@@ -149,11 +151,11 @@ test("ReceiptTracker: which reactions count, per target", () => {
     t.missing().map((m) => [m.rec.seq, m.noReceived, m.noSeen]),
     [[10, [], ["B"]]],
   );
-  // @all / @group: anyone counts.
-  t.noteOwn(11, "@all hi", { names: [], anyone: true });
-  assert.equal(ReceiptTracker.satisfied(t.get(11)!, "received"), false);
+  // @all / @group only: no receipts are expected, so nothing satisfies it and it isn't listed as missing.
+  t.noteOwn(11, "@all hi", { names: [], broadcast: true });
   t.noteReaction("Z", 11, "📬");
-  assert.equal(ReceiptTracker.satisfied(t.get(11)!, "received"), true);
+  assert.equal(ReceiptTracker.satisfied(t.get(11)!, "received"), false);
+  assert.deepEqual(t.missing().map((m) => m.rec.seq), [10]);
   // Bounded.
   const small = new ReceiptTracker(3);
   for (let s = 1; s <= 5; s++) small.noteOwn(s, "x", null);
@@ -162,7 +164,7 @@ test("ReceiptTracker: which reactions count, per target", () => {
 
 test("ReceiptTracker.wait: resolves on the receipt, times out, or aborts", async () => {
   const t = new ReceiptTracker();
-  t.noteOwn(1, "@B hi", { names: ["B"], anyone: false });
+  t.noteOwn(1, "@B hi", { names: ["B"], broadcast: false });
   const w = t.wait(1, "received", 5000);
   setTimeout(() => t.noteReaction("B", 1, "📬"), 20);
   assert.equal((await w).satisfied, true);
@@ -177,7 +179,7 @@ test("ReceiptTracker.wait: resolves on the receipt, times out, or aborts", async
 test("describeReceipts", () => {
   let now = 0;
   const t = new ReceiptTracker(200, () => now);
-  t.noteOwn(41, "@B go", { names: ["B"], anyone: false });
+  t.noteOwn(41, "@B go", { names: ["B"], broadcast: false });
   assert.match(describeReceipts(t.get(41)!, { level: "seen", waitedSec: 60 }), /^no 📬 within 60s from B — the recipient may not be running/);
   now = 800;
   t.noteReaction("B", 41, "📬");
@@ -190,7 +192,7 @@ test("describeReceipts", () => {
 
 test("WakeBudget.forceWake bypasses the throttle and a pause but counts toward the hourly cap", () => {
   let now = 0;
-  const b = new WakeBudget({ burst: 1, refillPerMinute: 0, hourlyCap: 2, quietResumeMinutes: 10 }, () => now);
+  const b = new WakeBudget({ burst: 1, refillPerMinute: 0, hourlyCap: 2, quietResumeMinutes: 10, interruptsPerHour: 6 }, () => now);
   assert.equal(b.tryWake().allowed, true);
   assert.equal(b.tryWake().allowed, false, "throttled");
   b.forceWake();
@@ -216,9 +218,10 @@ test("Inbox.attemptUrgent delivers the interrupt first, with what's buffered; re
   assert.match(u.content, /@A second/);
   assert.deepEqual(u.addressedSeqs, [2, 4]);
   assert.equal(inbox.unseenCount, 0);
-  inbox.requeue(u.taken.addressed, u.taken.other);
+  inbox.requeue(u.taken);
   assert.equal(inbox.pending.length, 2);
-  assert.equal(inbox.wantsWake(), true);
+  assert.equal(inbox.wantsWake(), false, "requeued messages are held, not woken for");
+  assert.equal(inbox.hasHeld, true);
 });
 
 test("profile: receipts and busyNoticeAfterSec", () => {
@@ -244,10 +247,73 @@ test("ReceiptTracker: an unseen @name is waited for exactly; someone else's rece
   assert.equal(ReceiptTracker.satisfied(tr.get(5)!, "received"), true);
 });
 
-test("describeReceipts says when any group member counts", () => {
+test("receipts only for direct addressing: @all/@group expect none; mixed targets wait for the names", () => {
   const tr = new ReceiptTracker(200, () => 0);
-  tr.noteOwn(6, "@reviewers look", resolveTargets("@reviewers look", ["A"], "A", undefined, ["reviewers"]));
-  assert.match(describeReceipts(tr.get(6)!), /any member of @reviewers counts/);
+  const g = resolveTargets("@reviewers look", ["A"], "A", undefined, ["reviewers"]);
+  assert.match(noReceiptsExpected(g)!, /only sent for direct @name or reply addressing, and this message addresses only @reviewers/);
+  assert.match(noReceiptsExpected(resolveTargets("@all hi", ["A"], "A"))!, /addresses only @all/);
+  assert.match(noReceiptsExpected(null)!, /addresses nobody/);
+  tr.noteOwn(6, "@reviewers look", g);
+  assert.match(describeReceipts(tr.get(6)!), /no receipts expected/);
+  const mixed = resolveTargets("@B and @all", ["A", "B"], "A")!;
+  assert.equal(noReceiptsExpected(mixed), null);
+  tr.noteOwn(7, "@B and @all", mixed);
+  tr.noteReaction("C", 7, "📬");
+  assert.equal(ReceiptTracker.satisfied(tr.get(7)!, "received"), false, "C (an @all member) doesn't count");
+  tr.noteReaction("B", 7, "📬");
+  assert.equal(ReceiptTracker.satisfied(tr.get(7)!, "received"), true);
+  assert.match(describeReceipts(tr.get(7)!), /@all members send no receipts/);
+});
+
+test("resolveTargets: a name with spaces is only recognized after it has posted; we don't guess", () => {
+  // Before "Pi Bot" has posted, "@Pi Bot" reads as the exact name "Pi" (documented), and says so when waiting.
+  const before = resolveTargets("@Pi Bot please check", ["A"], "A");
+  assert.deepEqual(before, { names: ["Pi"], broadcast: false, unseen: ["Pi"] });
+  const tr = new ReceiptTracker(200, () => 0);
+  tr.noteOwn(8, "@Pi Bot please check", before);
+  assert.match(describeReceipts(tr.get(8)!), /waiting for exact name Pi \(not seen in this channel yet\) — a name with spaces is only recognized once that participant has posted/);
+  // Once it has posted (e.g. its join intro), the full name wins over a shorter known prefix.
+  assert.deepEqual(resolveTargets("@Pi Bot please check", ["A", "Pi", "Pi Bot"], "A"), { names: ["Pi Bot"], broadcast: false });
+});
+
+test("ReceiptTracker.cancelWaits resolves pending waits as not satisfied and clears their timers", async () => {
+  const t = new ReceiptTracker();
+  t.noteOwn(1, "@B hi", { names: ["B"], broadcast: false });
+  const w = t.wait(1, "received", 60_000);
+  assert.equal(t.waiting, 1);
+  t.cancelWaits("left the channel");
+  const r = await w;
+  assert.deepEqual([r.satisfied, r.aborted, r.cancelled], [false, false, "left the channel"]);
+  assert.equal(t.waiting, 0);
+});
+
+test("backoffDelay: jittered, exponential from ~200 ms, capped at 5 s", () => {
+  assert.equal(backoffDelay(0, () => 0), 100);
+  assert.equal(backoffDelay(0, () => 1), 200);
+  assert.equal(backoffDelay(3, () => 1), 1600);
+  assert.equal(backoffDelay(10, () => 1), 5000);
+  assert.equal(backoffDelay(50, () => 0), 2500);
+});
+
+test("ReactionQueue: a reaction is done only once posted; a failed one can be queued again; uncertain counts as done", async () => {
+  const sent: string[] = [];
+  const outcomes: (boolean | null)[] = [false, true, null];
+  const q = new ReactionQueue(async (seq, emoji) => {
+    sent.push(`${seq}${emoji}`);
+    return outcomes.shift()!;
+  });
+  q.enqueue(1, "📬");
+  await q.idle();
+  assert.equal(q.has(1, "📬"), false, "gave up: not done");
+  assert.equal(q.enqueue(1, "📬"), true, "can be queued again");
+  await q.idle();
+  assert.equal(q.has(1, "📬"), true);
+  assert.equal(q.enqueue(1, "📬"), false, "at most once");
+  q.enqueue(2, "👀");
+  await q.idle();
+  assert.equal(q.has(2, "👀"), true, "uncertain: never retried, so never doubled");
+  assert.equal(q.enqueue(2, "👀"), false);
+  assert.deepEqual(sent, ["1📬", "1📬", "2👀"]);
 });
 
 test("acks: non-waking text, parseable, counted as receipt chatter", () => {

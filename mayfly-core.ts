@@ -24,6 +24,12 @@ export interface PostResult {
   error?: string;
   /** Messages from others not yet delivered, seen while posting (after our post, or the missed page on 409). */
   newMessages: MayflyMessage[];
+  /**
+   * On a 409 only: every event from others in the missed page(s), decrypted, BEFORE dedup. It includes messages
+   * the watcher had already delivered (which `newMessages` leaves out), so the caller can tell what actually
+   * raced its post.
+   */
+  conflictEvents?: MayflyMessage[];
 }
 
 /** Unrecoverable: channel gone (404) or wrong key (401). Stop watching. */
@@ -294,7 +300,8 @@ export function openChannel(url: string, name: string): Channel {
           events = events.concat(rest.events);
           last = rest.last;
         }
-        return { posted: false, conflict: true, newMessages: ingest(events, last) };
+        const conflictEvents = events.filter((ev) => typeof ev?.seq === "number").map(open).filter((m) => m.from !== channel.name);
+        return { posted: false, conflict: true, newMessages: ingest(events, last), conflictEvents };
       }
       // Our own post is seq=json.id; mark it known. Events are replies after it.
       if (typeof json.id === "number" && json.id > head) head = json.id;

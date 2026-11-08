@@ -68,8 +68,11 @@ async function makePi(branch: Entry[] = []) {
     sessionManager: { getBranch: () => branch },
   };
   ext(pi);
+  /** Fire an event; returns the handlers' results (e.g. before_agent_start's { message }). */
   const fire = async (ev: string, payload: unknown = {}) => {
-    for (const h of handlers[ev] ?? []) await h(payload, ctx);
+    const out: any[] = [];
+    for (const h of handlers[ev] ?? []) out.push(await h(payload, ctx));
+    return out.filter((x) => x !== undefined);
   };
   await fire("session_start");
   return {
@@ -454,7 +457,7 @@ describe("extension wiring against a local Mayfly server", { skip }, () => {
     assert.equal(reactsBy(hist, "A", hist.find((m) => m.text.startsWith("/interrupt"))!.seq, "📬"), 0, "no receipt for a disallowed interrupt");
   });
 
-  test("a steered wake lost to an abort is delivered again after the run ends", async () => {
+  test("a steered wake lost to an abort is held, not redelivered; it comes with the next addressed message", async () => {
     const { url } = await createChannel(srv.origin);
     const P = await pi();
     await P.command(`join ${url} A -- testing`);
@@ -463,14 +466,215 @@ describe("extension wiring against a local Mayfly server", { skip }, () => {
     P.setIdle(false);
     await h.post("@A important");
     await until(() => P.wakes().length === 1, 3000, "the steered wake");
-    // The run is aborted before the steer is processed (no message_start), then ends.
+    // The run is aborted (Esc) before the steer is processed (no message_start), then ends.
     P.setIdle(true);
     await P.fire("agent_end", { type: "agent_end", messages: [] });
-    await until(() => P.wakes().length === 2, 3000, "the redelivery");
+    await sleep(2500);
+    assert.equal(P.wakes().length, 1, "an aborted run never restarts by itself");
+    assert.match((await P.call("mayfly_status", {})).content[0].text, /held: /);
+    await h.post("@A next thing");
+    await until(() => P.wakes().length === 2, 3000, "the next addressed wake");
     assert.match(P.wakes()[1].m.content, /@A important/);
+    assert.match(P.wakes()[1].m.content, /@A next thing/);
     await P.emitMessageStart(P.wakes()[1].m);
     await P.fire("agent_end", { type: "agent_end", messages: [] });
     await sleep(1500);
     assert.equal(P.wakes().length, 2, "a seen wake is not redelivered");
+  });
+
+  test("held messages ride along with the user's next prompt (before_agent_start), once", async () => {
+    const { url } = await createChannel(srv.origin);
+    const P = await pi();
+    await P.command(`join ${url} A -- testing`);
+    const h = open(url, "H");
+    await sleep(300);
+    P.setIdle(false);
+    await h.post("@A important");
+    await until(() => P.wakes().length === 1, 3000, "the steered wake");
+    P.setIdle(true);
+    await P.fire("agent_end", { type: "agent_end", messages: [] });
+    await sleep(1300);
+    // Our own custom-message runs bring nothing.
+    assert.deepEqual(await P.fire("before_agent_start", { type: "before_agent_start", messageType: "custom", message: {} }), []);
+    const [r] = await P.fire("before_agent_start", { type: "before_agent_start", messageType: "user", prompt: "carry on" });
+    assert.equal(r.message.customType, "mayfly");
+    assert.match(r.message.content, /@A important/);
+    assert.match(r.message.content, /Held after your previous run/);
+    assert.deepEqual(await P.fire("before_agent_start", { type: "before_agent_start", messageType: "user", prompt: "again" }), []);
+    // In RPC mode Pi may still deliver the stale steer: its seqs leave the inbox, so nothing is shown twice later.
+    await P.emitMessageStart(r.message);
+    await sleep(1000);
+    assert.equal(P.wakes().length, 1, "no auto-wake");
+  });
+
+  test("RPC: a stale steer Pi kept after the abort removes its messages from the inbox when it arrives", async () => {
+    const { url } = await createChannel(srv.origin);
+    const P = await pi();
+    await P.command(`join ${url} A -- testing`);
+    const h = open(url, "H");
+    await sleep(300);
+    P.setIdle(false);
+    await h.post("@A important");
+    await until(() => P.wakes().length === 1, 3000, "the steered wake");
+    P.setIdle(true);
+    await P.fire("agent_end", { type: "agent_end", messages: [] });
+    await sleep(1300); // requeued (held)
+    await P.emitMessageStart(P.wakes()[0].m); // Pi delivers the stale steer in the next run after all
+    await h.post("@A next");
+    await until(() => P.wakes().length === 2, 3000, "the next wake");
+    assert.doesNotMatch(P.wakes()[1].m.content, /@A important/, "not shown twice");
+  });
+
+  test("/interrupt over the per-sender limit: no abort, an ordinary addressed wake, and a ⛔ notice", async () => {
+    const { url } = await createChannel(srv.origin);
+    const lim = profileFile("intlimit", { budget: { interruptsPerHour: 1 } });
+    const P = await pi();
+    await P.command(`join ${url} A --profile=${lim} -- testing`);
+    const h = open(url, "H");
+    await sleep(300);
+    P.setIdle(false);
+    await h.post("/interrupt A first");
+    await until(() => P.wakes().length === 1, 4000, "the urgent wake");
+    assert.equal(P.aborts(), 1);
+    P.setIdle(false);
+    const r2 = await h.post("/interrupt A second");
+    await until(() => P.wakes().length === 2, 4000, "the ordinary wake");
+    assert.equal(P.aborts(), 1, "no abort over the limit");
+    const w = P.wakes()[1];
+    assert.deepEqual(w.o, { triggerTurn: true, deliverAs: "steer" });
+    assert.match(w.m.content, /\/interrupt A second/);
+    assert.doesNotMatch(w.m.content, /interrupted your current work/);
+    let hist: { from: string; text: string }[] = [];
+    for (let i = 0; i < 30 && !hist.some((m) => m.text.startsWith("⛔")); i++) {
+      await sleep(100);
+      hist = await h.history(20);
+    }
+    assert.ok(hist.some((m) => m.from === "A" && m.text === `⛔ A is treating it as a normal message — interrupt limit reached (#${r2.id} from H)`), JSON.stringify(hist));
+  });
+
+  test("waitFor on an @all or group-only message returns at once; mixed targets wait only for the names", async () => {
+    const { url } = await createChannel(srv.origin);
+    const A = await pi();
+    await A.command(`join ${url} A -- testing`);
+    const B = await pi();
+    await B.command(`join ${url} B -- testing`);
+    await sleep(500);
+    const t0 = Date.now();
+    const res = await A.call("mayfly_post", { text: "@all status?", waitFor: "received", timeoutSec: 30 });
+    assert.ok(Date.now() - t0 < 3000);
+    assert.match(res.content[0].text, /^Posted #\d+\. Not waiting: receipts are only sent for direct @name or reply addressing, and this message addresses only @all\./);
+    const res2 = await A.call("mayfly_post", { text: "@all and @B: check", waitFor: "received", timeoutSec: 10 });
+    assert.match(res2.content[0].text, /📬 B after/);
+    assert.match(res2.content[0].text, /@all members send no receipts/);
+  });
+
+  test("leaving ends a pending waitFor at once", async () => {
+    const { url } = await createChannel(srv.origin);
+    const A = await pi();
+    await A.command(`join ${url} A -- testing`);
+    await sleep(300);
+    const pending = A.call("mayfly_post", { text: "@Ghost hello?", waitFor: "received", timeoutSec: 60 });
+    await sleep(500);
+    const t0 = Date.now();
+    await A.call("mayfly_leave", {});
+    const res = await pending;
+    assert.ok(Date.now() - t0 < 2000);
+    assert.match(res.content[0].text, /wait cancelled: left the channel/);
+  });
+
+  // --- review regressions (PR #5) ------------------------------------------------------
+
+  test("R1: a 409 caused by a real message the watcher already delivered is surfaced, not auto-retried", async () => {
+    const { url } = await createChannel(srv.origin);
+    const P = await pi();
+    await P.command(`join ${url} A -- testing`);
+    const h = open(url, "H");
+    await sleep(500);
+    const realFetch = globalThis.fetch;
+    let delayNext = true;
+    globalThis.fetch = (async (u: any, init: any) => {
+      if (init?.method === "POST" && delayNext && String(u).includes("last=")) {
+        delayNext = false;
+        await sleep(800); // A's POST is in flight (stale cursor) while H's message lands and the watcher delivers it
+      }
+      return realFetch(u, init);
+    }) as any;
+    let res: any;
+    try {
+      const pending = P.call("mayfly_post", { text: "deploying now" });
+      await sleep(50);
+      await h.post("WAIT do not deploy, prod is on fire");
+      res = await pending;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    const out = res.content[0].text;
+    assert.match(out, /^Conflict/, out);
+    assert.match(out, /WAIT do not deploy, prod is on fire/, out);
+    assert.equal(res.isError, true);
+    const hist = await h.history(10);
+    assert.ok(!hist.some((m) => m.from === "A" && m.text === "deploying now"), "the post went out without the model seeing the conflicting message");
+  });
+
+  test("R2: with bare-name mentions on, a ⚡ ack naming us doesn't wake us", async () => {
+    const { url } = await createChannel(srv.origin);
+    const bare = profileFile("bare", { requireAtForMention: false });
+    const A = await pi();
+    await A.command(`join ${url} A --profile=${bare} -- testing`);
+    const B = await pi();
+    await B.command(`join ${url} B -- testing`);
+    await sleep(500);
+    let res: any;
+    for (let i = 0; i < 5; i++) {
+      res = await A.call("mayfly_interrupt", { target: "B", message: "check prod" });
+      if (!/^Conflict/.test(res.content[0].text)) break;
+    }
+    await until(() => B.wakes().length === 1, 4000, "B's urgent wake");
+    const h = open(url, "H");
+    for (let i = 0; i < 40 && !(await h.history(20)).some((m) => m.text.startsWith("⚡ B")); i++) await sleep(100);
+    await sleep(1000);
+    assert.equal(A.wakes().length, 0, "the ack woke the interrupter");
+  });
+
+  test("R3: after /stop, a receipt reaction from someone else doesn't start a turn", async () => {
+    const { url } = await createChannel(srv.origin);
+    const P = await pi();
+    await P.command(`join ${url} A -- testing`);
+    const h = open(url, "H");
+    await sleep(300);
+    P.setIdle(false);
+    const r = await h.post("@A do the thing");
+    await until(() => P.wakes().length === 1, 3000, "steered wake");
+    await sleep(100);
+    await h.post("/stop A");
+    await until(() => P.stops().length === 1, 4000, "stop handled");
+    await P.fire("agent_end", { type: "agent_end", messages: [] });
+    await sleep(1600);
+    assert.equal(P.wakes().length, 1, "held after the stop");
+    await h.post(`/react ${r.id} 📬`);
+    await sleep(1500);
+    assert.equal(P.wakes().length, 1, "a receipt reaction started a turn after /stop");
+  });
+
+  test("R4: eight agents, one burst of direct @name messages: every 📬 arrives; @all gets no receipts", async () => {
+    const { url } = await createChannel(srv.origin);
+    const names = ["A", "B", "C", "D", "E", "F", "G", "I"];
+    for (const n of names) await (await pi()).command(`join ${url} ${n} -- testing`);
+    const h = open(url, "H");
+    await sleep(1500);
+    const seqs: Record<string, number> = {};
+    for (const n of names) seqs[n] = (await h.post(`@${n} task for ${n}`)).id!;
+    let missing = names;
+    for (let i = 0; i < 120 && missing.length; i++) {
+      await sleep(250);
+      const hist = await h.history(300);
+      missing = names.filter((n) => reactsBy(hist, n, seqs[n], "📬") + reactsBy(hist, n, seqs[n], "👀") === 0);
+    }
+    assert.deepEqual(missing, [], "missing 📬");
+    const all = await h.post("@all status check");
+    await sleep(3000);
+    const hist = await h.history(300);
+    const got = hist.filter((m) => m.text === `/react ${all.id} 📬` || m.text === `/react ${all.id} 👀`);
+    assert.deepEqual(got.map((m) => m.from), [], "@all must not get receipts");
   });
 });

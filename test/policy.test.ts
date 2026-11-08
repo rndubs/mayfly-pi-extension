@@ -3,9 +3,13 @@ import assert from "node:assert/strict";
 import type { MayflyMessage } from "../mayfly-core.ts";
 import { parseStop } from "../mayfly-core.ts";
 import {
+  addressedReason,
   buildWakeMessage,
   decideWake,
+  directReason,
   Inbox,
+  InterruptLimiter,
+  targetsMeByName,
   mentions,
   parseReplyTarget,
   stopTargetsMe,
@@ -15,7 +19,7 @@ import {
   UNSEEN_MAX,
   WakeBudget,
 } from "../policy.ts";
-import { mergeProfile } from "../profile.ts";
+import { mergeProfile, validateProfile } from "../profile.ts";
 
 let seq = 100;
 const msg = (from: string, text: string, s = seq++): MayflyMessage => ({ seq: s, ts: "t", src: "s", from, text });
@@ -156,7 +160,7 @@ test("buildWakeMessage: huge backlog stays under maxBytes; long messages truncat
 
 test("WakeBudget: burst, refill, hourly cap pause, quiet resume, manual resume", () => {
   let now = 0;
-  const b = new WakeBudget({ burst: 3, refillPerMinute: 1, hourlyCap: 5, quietResumeMinutes: 10 }, () => now);
+  const b = new WakeBudget({ burst: 3, refillPerMinute: 1, hourlyCap: 5, quietResumeMinutes: 10, interruptsPerHour: 6 }, () => now);
   for (let i = 0; i < 3; i++) assert.deepEqual(b.tryWake(), { allowed: true, resumed: false });
   const t = b.tryWake();
   assert.equal(t.allowed, false);
@@ -191,7 +195,7 @@ test("WakeBudget: burst, refill, hourly cap pause, quiet resume, manual resume",
 
 test("WakeBudget: a pause reports when quiet resume is possible and resumes on the next try", () => {
   let now = 0;
-  const b = new WakeBudget({ burst: 100, refillPerMinute: 100, hourlyCap: 1, quietResumeMinutes: 10 }, () => now);
+  const b = new WakeBudget({ burst: 100, refillPerMinute: 100, hourlyCap: 1, quietResumeMinutes: 10, interruptsPerHour: 6 }, () => now);
   b.noteAddressed();
   assert.deepEqual(b.tryWake(), { allowed: true, resumed: false });
   now += 60_000;
@@ -210,7 +214,7 @@ test("WakeBudget: a pause reports when quiet resume is possible and resumes on t
 
 test("WakeBudget: rolling hour forgets old wakes", () => {
   let now = 0;
-  const b = new WakeBudget({ burst: 100, refillPerMinute: 100, hourlyCap: 2, quietResumeMinutes: 10 }, () => now);
+  const b = new WakeBudget({ burst: 100, refillPerMinute: 100, hourlyCap: 2, quietResumeMinutes: 10, interruptsPerHour: 6 }, () => now);
   b.tryWake();
   b.tryWake();
   now += 3_600_001;
@@ -396,4 +400,133 @@ test("buildWakeMessage: a line exactly as long as the remaining room is shown tr
   assert.equal(w.omitted, 0);
   assert.match(w.content, /\[#7 B\] x+ … \[truncated/);
   assert.ok(bytes(w.content) <= maxBytes);
+});
+
+// --- review regressions (PR #5) -----------------------------------------------------
+
+test("R2: acks, busy notices and receipts are never addressed, even with bare-name mentions on", () => {
+  const p = prof({ requireAtForMention: false });
+  const ack = msg("B", "⚡ B was idle — handling it (#41 from A)");
+  const busy = msg("B", "⏳ B got #41 but is busy (bash, running 6m). It will read it after the current step; /interrupt B <message> to break in.");
+  for (const m of [ack, busy, msg("B", "/react 41 📬")]) {
+    assert.equal(addressedReason(m, state("A"), p), null, m.text);
+    assert.equal(decideWake(m, state("A"), p).wake, false, m.text);
+    assert.equal(decideWake(m, state("A"), { ...p, wake: "all" }).wake, false, m.text);
+  }
+  // A plain message naming A still counts with bare-name mentions on.
+  assert.equal(decideWake(msg("B", "A, can you look?"), state("A"), p).wake, true);
+  // The inbox classifies the same way: the ack is recorded as unseen, not pending, and owes no wake.
+  const ib = new Inbox(p, state("A"));
+  assert.equal(ib.add([ack]), false);
+  assert.deepEqual([ib.pending.length, ib.unseen.length], [0, 1]);
+});
+
+test("directReason: @name, /re to our message, bare name only if enabled; not @all or @group", () => {
+  const p = prof({ groups: ["rev"] });
+  assert.match(directReason(msg("H", "@A go"), state("A"), p)!, /mentions @A/);
+  assert.match(directReason(msg("H", "/re 7 thanks"), state("A", [7]), p)!, /reply to our #7/);
+  assert.equal(directReason(msg("H", "@all go"), state("A"), p), null);
+  assert.equal(directReason(msg("H", "@rev go"), state("A"), p), null);
+  assert.ok(addressedReason(msg("H", "@rev go"), state("A"), p), "still addressed (wakes)");
+  assert.equal(directReason(msg("H", "A go"), state("A"), p), null);
+  assert.ok(directReason(msg("H", "A go"), state("A"), prof({ requireAtForMention: false })));
+  assert.equal(targetsMeByName("A", "a"), true);
+  assert.equal(targetsMeByName("all", "A"), false);
+});
+
+test("R3 (unit): a batch only asks for a wake if it brings something waking; held messages wait", () => {
+  const ib = new Inbox(prof(), state("A"));
+  ib.add([msg("H", "@A do the thing", 1)]);
+  ib.hold(); // a /stop arrived
+  assert.equal(ib.wantsWake(), false);
+  assert.equal(ib.hasHeld, true);
+  assert.equal(ib.add([msg("H", "/react 1 📬", 2)]), false, "a receipt never wakes");
+  assert.equal(ib.add([msg("H", "plain chatter", 3)]), false);
+  assert.equal(ib.attempt("h").kind, "none");
+  // A genuinely new addressed message wakes, and the held one rides along.
+  assert.equal(ib.add([msg("H", "@A next", 4)]), true);
+  const w = ib.attempt("h");
+  assert.equal(w.kind, "wake");
+  if (w.kind === "wake") {
+    assert.match(w.content, /do the thing/);
+    assert.match(w.content, /@A next/);
+  }
+  assert.equal(ib.hasHeld, false);
+});
+
+test("Inbox.requeue: held, no wake owed; drop counts restored; release / takeHeld deliver it", () => {
+  const ib = new Inbox(prof({ wake: "none" }), state("A"));
+  for (let i = 0; i < PENDING_MAX + 5; i++) ib.add([msg("H", `@A n${i}`, 1000 + i)]);
+  ib.setProfile(prof());
+  ib.add([msg("H", "@A last", 5000)]);
+  const w = ib.attempt("h");
+  assert.equal(w.kind, "wake");
+  if (w.kind !== "wake") return;
+  assert.equal(w.taken.droppedAddressed, 6);
+  ib.add([msg("H", "chatter after", 6000)]);
+  ib.requeue(w.taken);
+  assert.equal(ib.wantsWake(), false);
+  assert.equal(ib.hasHeld, true);
+  assert.equal(ib.droppedAddressed, 6, "drop count restored");
+  assert.equal(ib.unseenCount, PENDING_MAX + 6 + 1);
+  assert.equal(ib.pending.at(-1)!.text, "@A last");
+  // A user turn takes what is held (no budget).
+  const h = ib.takeHeld("h", ["note"]);
+  assert.ok(h);
+  assert.match(h!.content, /6 earlier addressed message\(s\) omitted|earlier addressed message\(s\) omitted/);
+  assert.equal(ib.takeHeld("h"), null);
+  // release() (mayfly_resume) owes the wake again.
+  ib.add([msg("H", "@A x", 7000)]);
+  ib.attempt("h");
+  const w2 = ib.attempt("h");
+  assert.equal(w2.kind, "none");
+  ib.requeue({ addressed: [msg("H", "@A lost", 7001)], other: [] });
+  assert.equal(ib.wantsWake(), false);
+  assert.equal(ib.release(), true);
+  // forgetSeqs (the stale steer reached the model after all) clears it.
+  ib.forgetSeqs([7001]);
+  assert.equal(ib.wantsWake(), false);
+  assert.equal(ib.unseenCount, 0);
+});
+
+test("Inbox: under wake=all, markSeen/forget leave no wake owed when only chatter remains", () => {
+  const ib = new Inbox(prof({ wake: "all" }), state("A"));
+  ib.add([msg("B", "/react 3 📬", 10), msg("B", "⚡ B was idle — handling it (#3 from H)", 11), msg("H", "real", 12)]);
+  assert.equal(ib.wantsWake(), true);
+  ib.markSeen(12, 12);
+  assert.equal(ib.wantsWake(), false, "only chatter left");
+  assert.equal(ib.unseenCount, 2);
+});
+
+test("InterruptLimiter: per sender, rolling hour (fake clock)", () => {
+  let now = 0;
+  const l = new InterruptLimiter(2, () => now);
+  assert.equal(l.tryInterrupt("A"), true);
+  now += 1000;
+  assert.equal(l.tryInterrupt("a"), true, "case-insensitive");
+  assert.equal(l.tryInterrupt("A"), false, "over the limit");
+  assert.equal(l.tryInterrupt("B"), true, "per sender");
+  assert.equal(l.used("A"), 2);
+  now = 3_600_001; // the first one left the window
+  assert.equal(l.tryInterrupt("A"), true);
+  assert.equal(l.tryInterrupt("A"), false);
+  const zero = new InterruptLimiter(0, () => now);
+  assert.equal(zero.tryInterrupt("A"), false, "0 disables urgent interrupts");
+});
+
+test("Inbox.addAddressed: a downgraded interrupt wakes normally, but not under wake=none", () => {
+  const ib = new Inbox(prof(), state("A"));
+  assert.equal(ib.addAddressed([msg("H", "/interrupt A stop", 1)]), true);
+  const w = ib.attempt("h");
+  assert.ok(w.kind === "wake" && /\/interrupt A stop/.test(w.content));
+  const none = new Inbox(prof({ wake: "none" }), state("A"));
+  assert.equal(none.addAddressed([msg("H", "/interrupt A stop", 1)]), false);
+  assert.equal(none.pending.length, 1);
+});
+
+test("profile: budget.interruptsPerHour (default 6), validated", () => {
+  assert.equal(mergeProfile().budget.interruptsPerHour, 6);
+  assert.equal(mergeProfile(validateProfile({ budget: { interruptsPerHour: 0 } })).budget.interruptsPerHour, 0);
+  assert.throws(() => validateProfile({ budget: { interruptsPerHour: 1.5 } }), /budget\.interruptsPerHour: must be an integer >= 0/);
+  assert.throws(() => validateProfile({ budget: { interruptsPerHour: -1 } }), /interruptsPerHour/);
 });

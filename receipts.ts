@@ -125,32 +125,54 @@ export class BusyTracker {
   }
 }
 
+// --- backoff ----------------------------------------------------------------------
+
+/** Jittered exponential backoff for automatic posts that lost a race: attempt 0 → ~200 ms, doubling, capped at 5 s. */
+export const BACKOFF = { baseMs: 200, maxMs: 5000, giveUpMs: 60_000 };
+
+/** Delay before retry number `attempt` (0-based): a random value in [cap/2, cap], cap = min(max, base·2^attempt). */
+export function backoffDelay(attempt: number, rand: () => number = Math.random, b: { baseMs: number; maxMs: number } = BACKOFF): number {
+  const cap = Math.min(b.maxMs, b.baseMs * 2 ** Math.min(attempt, 30));
+  return Math.round(cap / 2 + (rand() * cap) / 2);
+}
+
 // --- reaction queue (recipient side) ----------------------------------------------
 
 /**
- * Posts receipt reactions one at a time. Each (seq, emoji) is posted at most once; a 📬 still waiting when a
- * 👀 for the same seq is queued is dropped (👀 implies received). `send` resolves true when posted.
+ * `send` outcome: true = posted; null = uncertain (it may have been posted: never retried, so a receipt is never
+ * doubled); false = not posted (the caller already retried with backoff and gave up).
+ */
+export type SendOutcome = boolean | null;
+
+/**
+ * Posts receipt reactions one at a time. Each (seq, emoji) is posted at most once: it counts as done only once
+ * `send` reports it posted (or possibly posted). A 📬 still waiting when a 👀 for the same seq is queued is dropped
+ * (👀 implies received). One that `send` gave up on may be queued again later.
  */
 export class ReactionQueue {
   private queue: { seq: number; emoji: string }[] = [];
+  private queued = new Set<string>();
   private done = new Set<string>();
   private running = false;
   private closed = false;
-  private send: (seq: number, emoji: string) => Promise<boolean>;
+  private send: (seq: number, emoji: string) => Promise<SendOutcome>;
   private readonly max: number;
 
-  constructor(send: (seq: number, emoji: string) => Promise<boolean>, max = 2000) {
+  constructor(send: (seq: number, emoji: string) => Promise<SendOutcome>, max = 2000) {
     this.send = send;
     this.max = max;
   }
 
-  /** Queue a reaction. Returns false if it was already queued or posted. */
+  /** Queue a reaction. Returns false if it is already queued or posted. */
   enqueue(seq: number, emoji: string): boolean {
     if (this.closed) return false;
     const key = `${seq}:${emoji}`;
-    if (this.done.has(key)) return false;
-    this.remember(key);
-    if (emoji === SEEN) this.queue = this.queue.filter((q) => !(q.seq === seq && q.emoji === RECEIVED));
+    if (this.done.has(key) || this.queued.has(key)) return false;
+    if (emoji === SEEN) {
+      this.queue = this.queue.filter((q) => !(q.seq === seq && q.emoji === RECEIVED));
+      this.queued.delete(`${seq}:${RECEIVED}`);
+    }
+    this.queued.add(key);
     this.queue.push({ seq, emoji });
     void this.pump();
     return true;
@@ -162,6 +184,7 @@ export class ReactionQueue {
     if (this.done.size > this.max) this.done.delete(this.done.values().next().value as string);
   }
 
+  /** Posted (or possibly posted). */
   has(seq: number, emoji: string) {
     return this.done.has(`${seq}:${emoji}`);
   }
@@ -178,6 +201,7 @@ export class ReactionQueue {
   close() {
     this.closed = true;
     this.queue = [];
+    this.queued.clear();
   }
 
   private async pump() {
@@ -186,11 +210,20 @@ export class ReactionQueue {
     try {
       while (this.queue.length && !this.closed) {
         const { seq, emoji } = this.queue.shift()!;
-        try {
-          await this.send(seq, emoji);
-        } catch {
-          /* best effort */
+        const key = `${seq}:${emoji}`;
+        // Already posted while it waited (e.g. learned from history)?
+        if (this.done.has(key)) {
+          this.queued.delete(key);
+          continue;
         }
+        let out: SendOutcome = false;
+        try {
+          out = await this.send(seq, emoji);
+        } catch {
+          out = false;
+        }
+        this.queued.delete(key);
+        if (out !== false) this.remember(key);
       }
     } finally {
       this.running = false;
@@ -201,13 +234,14 @@ export class ReactionQueue {
 // --- receipt tracking (sender side) -------------------------------------------------
 
 /**
- * Who a message of ours is addressed to. `names`: exact participants whose receipts we wait for (including
- * @names we haven't seen post yet, listed again in `unseen`). `anyone`: @all or a known group, where a receipt
- * from anyone counts (`groups` lists the groups, for the summary).
+ * Who a message of ours is addressed to. Receipts are only sent for DIRECT addressing (@name, or a /re reply to
+ * the recipient's own message), so `names` lists exactly the participants whose 📬/👀 we can expect (including
+ * @names we haven't seen post yet, listed again in `unseen`). `broadcast`: the message also addresses @all or a
+ * known group (`groups`); those members wake but send no receipts.
  */
 export interface Targets {
   names: string[];
-  anyone: boolean;
+  broadcast: boolean;
   groups?: string[];
   unseen?: string[];
 }
@@ -218,8 +252,12 @@ const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 /**
  * Parse whom `text` addresses: known participant names mentioned with @ (longest first, so "Pi Bot" wins over
  * "Pi"), plus the author of the message it replies to. `@all`, or an @tag that is a known group (learned from join
- * intros), means anyone. Any other @tag is taken as the exact name of someone who hasn't posted yet: we wait for
- * that name, not for anyone. Returns null if it addresses nobody.
+ * intros), is a broadcast. Any other @tag is taken as the exact name of someone who hasn't posted yet: we wait for
+ * that name, not for anyone.
+ *
+ * Names with spaces are only recognized once that participant has posted in the channel (its join intro counts):
+ * before that, `@Pi Bot` reads as the exact name `Pi`. We don't guess where an unknown name ends.
+ * Returns null if it addresses nobody.
  */
 export function resolveTargets(
   text: string,
@@ -241,7 +279,7 @@ export function resolveTargets(
       rest = rest.replace(re, " ");
     }
   }
-  let anyone = false;
+  let broadcast = false;
   const groups: string[] = [];
   const unseen: string[] = [];
   const groupSet = new Set([...knownGroups].map((g) => g.toLowerCase()));
@@ -250,9 +288,9 @@ export function resolveTargets(
     const tag = m[1];
     const lc = tag.toLowerCase();
     if (lc === me.toLowerCase()) continue;
-    if (lc === "all") anyone = true;
+    if (lc === "all") broadcast = true;
     else if (groupSet.has(lc)) {
-      anyone = true;
+      broadcast = true;
       if (!groups.some((g) => g.toLowerCase() === lc)) groups.push(tag);
     } else if (!names.some((x) => x.toLowerCase() === lc)) {
       add(tag);
@@ -260,8 +298,15 @@ export function resolveTargets(
     }
   }
   if (replyToAuthor) add(replyToAuthor);
-  if (!names.length && !anyone) return null;
-  return { names, anyone, ...(groups.length ? { groups } : {}), ...(unseen.length ? { unseen } : {}) };
+  if (!names.length && !broadcast) return null;
+  return { names, broadcast, ...(groups.length ? { groups } : {}), ...(unseen.length ? { unseen } : {}) };
+}
+
+/** Why waiting for receipts on a message with these targets is pointless, or null if someone named will send them. */
+export function noReceiptsExpected(t: Targets | null): string | null {
+  if (t?.names.length) return null;
+  const what = !t ? "addresses nobody" : t.groups?.length ? `addresses only ${t.groups.map((g) => "@" + g).join(", ")}` : "addresses only @all";
+  return `receipts are only sent for direct @name or reply addressing, and this message ${what}`;
 }
 
 export interface OwnRecord {
@@ -282,6 +327,8 @@ export type ReceiptLevel = "received" | "seen";
 export interface WaitResult {
   satisfied: boolean;
   aborted: boolean;
+  /** Set when the wait was cut short by cancelWaits() (e.g. "left the channel"). */
+  cancelled?: string;
   record: OwnRecord;
 }
 
@@ -289,6 +336,7 @@ export interface WaitResult {
 export class ReceiptTracker {
   private records = new Map<number, OwnRecord>();
   private listeners = new Set<() => void>();
+  private cancellers = new Set<(why: string) => void>();
   private now: Clock;
   readonly max: number;
 
@@ -364,23 +412,24 @@ export class ReceiptTracker {
     return [...this.records.values()].sort((a, b) => b.seq - a.seq).slice(0, n);
   }
 
-  /** Is `rec` acknowledged at `level` by its targets (all named targets; or anyone for @all/@group/unaddressed)? */
+  /**
+   * Is `rec` acknowledged at `level` by every directly addressed target? With no named target (only @all/@group, or
+   * nobody) no receipts are expected, so there is nothing to wait for: false (callers don't wait in that case).
+   */
   static satisfied(rec: OwnRecord, level: ReceiptLevel): boolean {
     const got = level === "seen" ? rec.seen : rec.received;
     const names = rec.targets?.names ?? [];
-    if (names.length) return names.every((n) => has(got, n));
-    return got.size > 0;
+    return names.length > 0 && names.every((n) => has(got, n));
   }
 
   /** Our addressed messages still missing 📬 or 👀 from a target, newest first. */
   missing(n = 10): { rec: OwnRecord; noReceived: string[]; noSeen: string[] }[] {
     const out: { rec: OwnRecord; noReceived: string[]; noSeen: string[] }[] = [];
     for (const rec of this.recent(this.max)) {
-      if (!rec.targets) continue;
-      const who = rec.targets.names.length ? rec.targets.names : ["anyone"];
-      const lacks = (m: Map<string, number>) => (rec.targets!.names.length ? who.filter((w) => !has(m, w)) : m.size ? [] : who);
-      const noReceived = lacks(rec.received);
-      const noSeen = lacks(rec.seen);
+      const who = rec.targets?.names ?? [];
+      if (!who.length) continue; // @all/@group only: no receipts expected
+      const noReceived = who.filter((w) => !has(rec.received, w));
+      const noSeen = who.filter((w) => !has(rec.seen, w));
       if (noReceived.length || noSeen.length) out.push({ rec, noReceived, noSeen });
       if (out.length >= n) break;
     }
@@ -392,22 +441,34 @@ export class ReceiptTracker {
     const rec = this.ensure(seq);
     return new Promise((resolve) => {
       let t: ReturnType<typeof setTimeout> | undefined;
-      const finish = (satisfied: boolean, aborted = false) => {
+      const finish = (satisfied: boolean, aborted = false, cancelled?: string) => {
         this.listeners.delete(check);
+        this.cancellers.delete(cancel);
         if (t) clearTimeout(t);
         signal?.removeEventListener("abort", onAbort);
-        resolve({ satisfied, aborted, record: this.records.get(seq) ?? rec });
+        resolve({ satisfied, aborted, ...(cancelled ? { cancelled } : {}), record: this.records.get(seq) ?? rec });
       };
+      const cancel = (why: string) => finish(false, false, why);
       const check = () => {
         if (ReceiptTracker.satisfied(this.records.get(seq) ?? rec, level)) finish(true);
       };
       const onAbort = () => finish(false, true);
       if (signal?.aborted) return onAbort();
       this.listeners.add(check);
+      this.cancellers.add(cancel);
       signal?.addEventListener("abort", onAbort, { once: true });
       t = setTimeout(() => finish(ReceiptTracker.satisfied(this.records.get(seq) ?? rec, level)), timeoutMs);
       check();
     });
+  }
+
+  /** Resolve every pending wait as not satisfied, with `why` (leave, rejoin, shutdown). Clears their timers. */
+  cancelWaits(why: string) {
+    for (const c of [...this.cancellers]) c(why);
+  }
+
+  get waiting() {
+    return this.cancellers.size;
   }
 
   private emit() {
@@ -428,12 +489,13 @@ const secs = (ms: number) => (ms < 10_000 ? `${(Math.max(0, ms) / 1000).toFixed(
 
 /**
  * One line on the receipts for `rec`, e.g. "📬 B after 0.8s; 👀 B after 34s" or
- * "📬 B after 0.8s; no 👀 within 60s; B said it is busy (bash, 6m)".
+ * "📬 B after 0.8s; no 👀 within 60s; B said it is busy (bash, 6m)". Only directly addressed names are expected
+ * to react; @all/@group members send no receipts.
  */
 export function describeReceipts(rec: OwnRecord, opts: { level?: ReceiptLevel; waitedSec?: number } = {}): string {
   const parts: string[] = [];
-  const names = rec.targets?.names.length ? rec.targets.names : null;
-  const who = names ?? [...rec.received.keys()];
+  const names = rec.targets?.names ?? [];
+  const who = names.length ? names : [...rec.received.keys()];
   const within = opts.waitedSec !== undefined ? ` within ${opts.waitedSec}s` : " yet";
   for (const n of who) {
     const r = getCI(rec.received, n);
@@ -443,22 +505,27 @@ export function describeReceipts(rec: OwnRecord, opts: { level?: ReceiptLevel; w
     const s = getCI(rec.seen, n);
     if (s !== undefined) parts.push(`${SEEN} ${n} after ${secs(s - rec.postedAt)}`);
   }
-  if (!rec.received.size) {
-    parts.push(
-      `no ${RECEIVED}${within}${names ? ` from ${names.join(", ")}` : ""} — the recipient may not be running (or has receipts turned off)`,
-    );
-  } else {
-    const noRecv = names ? names.filter((n) => !has(rec.received, n)) : [];
-    if (noRecv.length) parts.push(`no ${RECEIVED} from ${noRecv.join(", ")}${within}`);
-    if (opts.level === "seen" || opts.level === undefined) {
-      const noSeen = names ? names.filter((n) => !has(rec.seen, n)) : rec.seen.size ? [] : ["anyone"];
-      if (noSeen.length) parts.push(`no ${SEEN}${names && names.length > 1 ? ` from ${noSeen.join(", ")}` : ""}${within}`);
+  if (names.length) {
+    const noRecv = names.filter((n) => !has(rec.received, n));
+    if (noRecv.length === names.length) {
+      parts.push(`no ${RECEIVED}${within} from ${names.join(", ")} — the recipient may not be running (or has receipts turned off)`);
+    } else {
+      if (noRecv.length) parts.push(`no ${RECEIVED} from ${noRecv.join(", ")}${within}`);
+      if (opts.level === "seen" || opts.level === undefined) {
+        const noSeen = names.filter((n) => !has(rec.seen, n));
+        if (noSeen.length) parts.push(`no ${SEEN}${names.length > 1 ? ` from ${noSeen.join(", ")}` : ""}${within}`);
+      }
     }
+  } else if (!parts.length) {
+    parts.push("no receipts expected (they are only sent for direct @name or reply addressing)");
   }
   // Say which rule decided "who counts", so the model can interpret a missing receipt.
   const t = rec.targets;
-  if (t?.unseen?.length) parts.push(`waiting for exact name${t.unseen.length > 1 ? "s" : ""} ${t.unseen.join(", ")} (not seen in this channel yet)`);
-  if (t?.anyone && !t.names.length) parts.push(t.groups?.length ? `any member of ${t.groups.map((g) => "@" + g).join(", ")} counts` : "anyone counts (@all)");
+  if (t?.unseen?.length)
+    parts.push(
+      `waiting for exact name${t.unseen.length > 1 ? "s" : ""} ${t.unseen.join(", ")} (not seen in this channel yet) — a name with spaces is only recognized once that participant has posted`,
+    );
+  if (t?.broadcast && names.length) parts.push(`${t.groups?.length ? t.groups.map((g) => "@" + g).join(", ") : "@all"} members send no receipts`);
   const seenBusy = new Set<string>();
   for (const b of [...rec.busy].reverse()) {
     if (seenBusy.has(b.name.toLowerCase())) continue;

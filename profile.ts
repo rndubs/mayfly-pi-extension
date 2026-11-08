@@ -32,6 +32,12 @@ export interface Profile {
     hourlyCap: number;
     /** After a pause, resume once this many minutes pass with no addressed messages. */
     quietResumeMinutes: number;
+    /**
+     * Urgent /interrupts accepted per sender per rolling hour (default 6). Within it an interrupt aborts the running
+     * work and wakes at once, bypassing the throttle and a pause. Above it, the interrupt is handled as an ordinary
+     * addressed message (no abort; normal budget and wake policy).
+     */
+    interruptsPerHour: number;
   };
   /** Who may `/stop` or `/interrupt` this agent: anyone in the channel, nobody, or these sender names. */
   allowStop: AllowStop;
@@ -50,7 +56,7 @@ export const DEFAULT_PROFILE: Profile = Object.freeze({
   groups: [],
   wake: "addressed",
   context: { recentK: 10, maxBytes: 16 * 1024 },
-  budget: { burst: 6, refillPerMinute: 1, hourlyCap: 30, quietResumeMinutes: 10 },
+  budget: { burst: 6, refillPerMinute: 1, hourlyCap: 30, quietResumeMinutes: 10, interruptsPerHour: 6 },
   allowStop: "anyone",
   requireAtForMention: true,
   receipts: true,
@@ -120,6 +126,7 @@ export function validateProfile(raw: unknown, source = "profile"): ProfileInput 
     refillPerMinute: { min: 0, int: false },
     hourlyCap: { min: 1, int: true },
     quietResumeMinutes: { min: 0, int: false },
+    interruptsPerHour: { min: 0, int: true },
   });
   if (raw.allowStop !== undefined) {
     const a = raw.allowStop;

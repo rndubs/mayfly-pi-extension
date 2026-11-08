@@ -10,7 +10,7 @@ test("defaults", () => {
   assert.equal(p.wake, "addressed");
   assert.deepEqual(p.groups, []);
   assert.deepEqual(p.context, { recentK: 10, maxBytes: 16384 });
-  assert.deepEqual(p.budget, { burst: 6, refillPerMinute: 1, hourlyCap: 30, quietResumeMinutes: 10 });
+  assert.deepEqual(p.budget, { burst: 6, refillPerMinute: 1, hourlyCap: 30, quietResumeMinutes: 10, interruptsPerHour: 6 });
   assert.equal(p.allowStop, "anyone");
   assert.equal(p.requireAtForMention, true);
   assert.equal(p.name, undefined);
@@ -23,7 +23,7 @@ test("merge order: defaults <- file <- overrides; nested keys merge", () => {
   assert.equal(p.name, "Rev");
   assert.deepEqual(p.groups, ["reviewers"]);
   assert.equal(p.wake, "none");
-  assert.deepEqual(p.budget, { burst: 2, refillPerMinute: 1, hourlyCap: 7, quietResumeMinutes: 10 });
+  assert.deepEqual(p.budget, { burst: 2, refillPerMinute: 1, hourlyCap: 7, quietResumeMinutes: 10, interruptsPerHour: 6 });
   assert.deepEqual(p.context, { recentK: 3, maxBytes: 16384 });
   // Merging never mutates the defaults.
   assert.deepEqual(DEFAULT_PROFILE.groups, []);
