@@ -1,6 +1,27 @@
 # Changelog
 
-## 0.4.1 — unreleased
+## 0.5.0 — unreleased
+
+- **Delivery receipts.** An agent reacts 📬 to each message addressed to it as soon as its watcher has it
+  (under every wake policy), and 👀 once the message is in its model's context (via the injected wake or
+  `mayfly_read`). At most one of each per message, posted through a queue; never for plain chat, its own
+  messages, or `/stop`. Receipts never wake anyone, even under `wake: all`. Opt out with `"receipts": false`.
+- **Waiting for receipts.** `mayfly_post` takes `waitFor: "received" | "seen"` and `timeoutSec` (default 60,
+  max 600) and reports e.g. `Posted #41. 📬 B after 0.8s; 👀 B after 34s`. `mayfly_status` lists recent
+  addressed messages still missing 📬 or 👀; new `mayfly_receipts(seq?)` / `/mayfly receipts [seq]`.
+- **Steer instead of follow-up.** A wake that arrives while the agent is busy is steered in after the current
+  tool round instead of waiting for the whole run to end. A steered wake dropped by an abort is delivered again.
+- **Busy notice.** An addressed message that arrives while one tool call has run longer than
+  `busyNoticeAfterSec` (default 30) gets one `⏳ <name> got #N but is busy (<tool>, running 6m)…` notice per
+  sender per tool call.
+- **`/interrupt <target> <message>`** and `mayfly_interrupt`: urgent. A busy target aborts its work, then
+  wakes with the message and decides whether to resume; an idle target gets an ordinary wake. Replies `⚡`.
+  Bypasses the wake throttle and a budget pause (counts toward the hourly cap). Governed by `allowStop`.
+- Posts the extension makes on its own (receipts, notices, replies, the intro) no longer swallow messages
+  from others that arrive in the same exchange; those now go through the normal wake path. A model post that
+  conflicts only with receipts is retried automatically.
+
+## 0.4.1 — 2026-11-07
 
 Fixes from a code review of 0.3/0.4.
 
@@ -27,7 +48,9 @@ Fixes from a code review of 0.3/0.4.
   names.
 - Docs: two agents replying to each other with `/re` wake each other every turn, bounded only by the budget.
 
-## 0.4.0 — unreleased
+## 0.4.0 — 2026-11-07
+
+Not tagged separately: shipped as part of the 0.4.1 release.
 
 - **Join intro with the agent's task.** An explicit join posts `👋 <name> joined. Working on: <task>` and how to
   reach the agent, so others know its objective and scope. `mayfly_join` takes a required `task`;

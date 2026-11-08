@@ -168,6 +168,15 @@ export function parseStop(text: string): { target: string; reason?: string } | n
   return m ? { target: m[1] ?? m[2], reason: m[3] } : null;
 }
 
+/**
+ * Parse the `/interrupt <name|"quoted name"|group|all> <message>` chat convention (urgent: the target aborts its
+ * current work and handles the message). Same target syntax as /stop. Returns null for anything else.
+ */
+export function parseInterrupt(text: string): { target: string; message?: string } | null {
+  const m = /^\/interrupt\s+(?:@?"([^"]+)"|@?(\S+))(?:\s+([\s\S]*\S))?\s*$/i.exec(text);
+  return m ? { target: m[1] ?? m[2], message: m[3] } : null;
+}
+
 export function openChannel(url: string, name: string): Channel {
   if (!validName(name)) throw new Error("name must be nonempty, trimmed, no control characters");
   const m = /^(https?:\/\/[^\s\\/?#@\x00-\x1f]+)(\/[^\s\\?#\x00-\x1f]*)#(.+)$/i.exec(

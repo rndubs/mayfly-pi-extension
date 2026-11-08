@@ -8,6 +8,8 @@
 
 import type { MayflyMessage } from "./mayfly-core.js";
 import type { Profile } from "./profile.js";
+// A .ts specifier so the unit tests can load this file directly; the build rewrites it to .js.
+import { isReceiptChatter } from "./receipts.ts";
 
 export type Clock = () => number;
 
@@ -50,6 +52,9 @@ export function parseReplyTarget(text: string): number | null {
   return m ? Number(m[1]) : null;
 }
 
+/** Chat commands handled by the watcher itself (never addressed, never wake the model directly). */
+const CONTROL = /^\/(stop|interrupt)(\s|$)/i;
+
 /** View-only conventions that never address anyone, even if they contain @-words. */
 const NON_ADDRESSING = /^\/(react|unreact|title|join)(\s|$)/i;
 
@@ -57,10 +62,12 @@ const NON_ADDRESSING = /^\/(react|unreact|title|join)(\s|$)/i;
 export function decideWake(msg: MayflyMessage, state: WakeState, profile: WakeProfile): WakeDecision {
   if (!msg.from) return { wake: false, reason: "undecryptable or invalid message" };
   if (msg.from === state.name) return { wake: false, reason: "own message" };
-  if (/^\/stop(\s|$)/i.test(msg.text)) return { wake: false, reason: "/stop is handled by the watcher" };
+  if (CONTROL.test(msg.text)) return { wake: false, reason: "/stop and /interrupt are handled by the watcher" };
   if (profile.wake === "none") return { wake: false, reason: "wake policy none" };
   const addressed = addressedReason(msg, state, profile);
   if (addressed) return { wake: true, reason: addressed };
+  // Receipts (📬/👀 reactions) and busy notices are automatic: never wake on them, or receipts could ping-pong.
+  if (isReceiptChatter(msg.text)) return { wake: false, reason: "receipt/busy notice (ignored)" };
   if (profile.wake === "all") return { wake: true, reason: "wake policy all" };
   if (NON_ADDRESSING.test(msg.text)) return { wake: false, reason: "reaction/title (recorded)" };
   return { wake: false, reason: "not addressed (recorded)" };
@@ -68,7 +75,7 @@ export function decideWake(msg: MayflyMessage, state: WakeState, profile: WakePr
 
 /** Why `msg` is addressed to us, or null. Independent of the wake policy. */
 export function addressedReason(msg: MayflyMessage, state: WakeState, profile: Pick<Profile, "groups" | "requireAtForMention">): string | null {
-  if (!msg.from || msg.from === state.name || NON_ADDRESSING.test(msg.text) || /^\/stop(\s|$)/i.test(msg.text)) return null;
+  if (!msg.from || msg.from === state.name || NON_ADDRESSING.test(msg.text) || CONTROL.test(msg.text)) return null;
   const re = parseReplyTarget(msg.text);
   if (re !== null && state.ownSeqs.has(re)) return `reply to our #${re}`;
   if (mentions(msg.text, state.name, profile.requireAtForMention)) return `mentions @${state.name}`;
@@ -181,6 +188,16 @@ export class WakeBudget {
     return { allowed: true, resumed };
   }
 
+  /**
+   * Spend a wake for an urgent /interrupt: bypasses the token bucket (throttle) and an existing pause, but is
+   * recorded against the hourly cap, so it still counts toward pausing ordinary auto-wake.
+   */
+  forceWake() {
+    this.refill();
+    this.tokens = Math.max(0, this.tokens - 1);
+    this.wakes.push(this.now());
+  }
+
   /** Manual or quiet resume: clear the pause and the hourly window, refill the bucket. */
   resume() {
     this.paused = false;
@@ -258,6 +275,10 @@ export interface WakeMessage {
   shownAddressed: number;
   shownOther: number;
   omitted: number;
+  /** Seqs of the addressed messages actually shown (they get a 👀 receipt once in the model's context). */
+  addressedSeqs: number[];
+  /** Seqs of every message shown. */
+  seqs: number[];
 }
 
 /**
@@ -273,7 +294,7 @@ export function buildWakeMessage(inp: WakeMessageInput): WakeMessage {
   const reserve = byteLen(head) + byteLen(footer) + 400;
   let room = Math.max(0, inp.maxBytes - reserve);
 
-  const take = (msgs: MayflyMessage[], limit: number) => {
+  const take = (msgs: MayflyMessage[], limit: number, shown: number[]) => {
     const picked: string[] = [];
     for (let i = msgs.length - 1; i >= 0 && picked.length < limit; i--) {
       // Each line costs its bytes plus a newline: cut it to fit both.
@@ -281,13 +302,16 @@ export function buildWakeMessage(inp: WakeMessageInput): WakeMessage {
       const b = byteLen(line) + 1;
       if (b > room || room <= 0) break;
       picked.unshift(line);
+      shown.unshift(msgs[i].seq);
       room -= b;
     }
     return picked;
   };
 
-  const a = take(inp.addressed, Infinity);
-  const o = take(inp.other, Math.max(0, inp.recentK));
+  const aSeqs: number[] = [];
+  const oSeqs: number[] = [];
+  const a = take(inp.addressed, Infinity, aSeqs);
+  const o = take(inp.other, Math.max(0, inp.recentK), oSeqs);
   const omittedAddressed = inp.addressed.length - a.length + (inp.droppedAddressedEarlier ?? 0);
   const omittedOther = inp.other.length - o.length + (inp.droppedEarlier ?? 0);
 
@@ -313,6 +337,8 @@ export function buildWakeMessage(inp: WakeMessageInput): WakeMessage {
     shownAddressed: a.length,
     shownOther: o.length,
     omitted: omittedAddressed + omittedOther,
+    addressedSeqs: aSeqs,
+    seqs: [...aSeqs, ...oSeqs].sort((x, y) => x - y),
   };
 }
 
@@ -320,7 +346,19 @@ export function buildWakeMessage(inp: WakeMessageInput): WakeMessage {
 
 export type WakeAction =
   | { kind: "none" }
-  | { kind: "wake"; content: string; addressed: number; other: number; omitted: number; resumed: boolean }
+  | {
+      kind: "wake";
+      content: string;
+      addressed: number;
+      other: number;
+      omitted: number;
+      resumed: boolean;
+      /** Shown addressed seqs (for 👀 receipts) and every shown seq. */
+      addressedSeqs: number[];
+      seqs: number[];
+      /** What this wake took out of the buffer, so it can be put back if the injection is lost. */
+      taken: { addressed: MayflyMessage[]; other: MayflyMessage[] };
+    }
   | { kind: "throttled"; retryInMs: number }
   | { kind: "paused"; justPaused: boolean; retryInMs: number };
 
@@ -407,8 +445,48 @@ export class Inbox {
         : { kind: "paused", justPaused: b.justPaused, retryInMs: b.retryInMs };
     const resumed = this.resumedNote || b.resumed;
     const notes = resumed ? ["(Auto-wake had been paused by the wake budget and has now resumed.)"] : [];
+    return this.wake(header, notes, resumed);
+  }
+
+  /**
+   * Urgent wake for an /interrupt: `m` is delivered first, as addressed, with `note` at the top. Bypasses the
+   * throttle and an existing pause, but counts toward the hourly cap. Everything else buffered rides along.
+   */
+  attemptUrgent(header: string, m: MayflyMessage, note: string): Extract<WakeAction, { kind: "wake" }> {
+    this.budget.forceWake();
+    this.pushPending(m);
+    this.wakeOwed = true;
+    return this.wake(header, [note], false);
+  }
+
+  private wake(header: string, notes: string[], resumed: boolean): Extract<WakeAction, { kind: "wake" }> {
+    const taken = { addressed: [...this.pending], other: [...this.unseen] };
     const msg = this.take(header, notes);
-    return { kind: "wake", content: msg.content, addressed: msg.shownAddressed, other: msg.shownOther, omitted: msg.omitted, resumed };
+    return {
+      kind: "wake",
+      content: msg.content,
+      addressed: msg.shownAddressed,
+      other: msg.shownOther,
+      omitted: msg.omitted,
+      resumed,
+      addressedSeqs: msg.addressedSeqs,
+      seqs: msg.seqs,
+      taken,
+    };
+  }
+
+  /**
+   * Put back messages from a wake whose injection never reached the model (e.g. a steered message dropped by an
+   * abort). They go before anything that arrived since; a wake is owed again if any were addressed.
+   */
+  requeue(addressed: MayflyMessage[], other: MayflyMessage[]) {
+    const have = new Set([...this.pending, ...this.unseen].map((m) => m.seq));
+    const fresh = (ms: MayflyMessage[]) => ms.filter((m) => !have.has(m.seq));
+    this.pending = [...fresh(addressed), ...this.pending];
+    this.unseen = [...fresh(other), ...this.unseen];
+    if (this.pending.length > PENDING_MAX) this.pending.splice(0, this.pending.length - PENDING_MAX);
+    if (this.unseen.length > UNSEEN_MAX) this.unseen.splice(0, this.unseen.length - UNSEEN_MAX);
+    if (this.pending.length || (this.profile.wake === "all" && this.unseen.length)) this.wakeOwed = true;
   }
 
   /** Build a message from everything buffered (no budget), and clear it. Used by mayfly_read(unread). */

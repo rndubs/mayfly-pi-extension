@@ -11,5 +11,5 @@
     "allowImportingTsExtensions": true,
     "erasableSyntaxOnly": true
   },
-  "include": ["index.ts", "mayfly-core.ts", "policy.ts", "profile.ts", "presence.ts", "test/*.ts"]
+  "include": ["index.ts", "mayfly-core.ts", "policy.ts", "profile.ts", "presence.ts", "receipts.ts", "test/*.ts"]
 }

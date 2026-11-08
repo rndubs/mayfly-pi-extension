@@ -48,6 +48,7 @@ async function makePi(branch: Entry[] = []) {
   const notes: string[] = [];
   let idle = true;
   let abortMakesIdle = true;
+  let aborts = 0;
   const pi: any = {
     on: (ev: string, h: any) => (handlers[ev] ??= []).push(h),
     registerTool: (t: any) => (tools[t.name] = t),
@@ -60,14 +61,15 @@ async function makePi(branch: Entry[] = []) {
     hasUI: true,
     isIdle: () => idle,
     abort: () => {
+      aborts++;
       if (abortMakesIdle) idle = true;
     },
     ui: { notify: (t: string) => notes.push(t), setStatus: () => {} },
     sessionManager: { getBranch: () => branch },
   };
   ext(pi);
-  const fire = async (ev: string) => {
-    for (const h of handlers[ev] ?? []) await h({}, ctx);
+  const fire = async (ev: string, payload: unknown = {}) => {
+    for (const h of handlers[ev] ?? []) await h(payload, ctx);
   };
   await fire("session_start");
   return {
@@ -78,8 +80,12 @@ async function makePi(branch: Entry[] = []) {
     stops: () => sent.filter((s) => s.m.customType === "mayfly-stop"),
     setIdle: (v: boolean) => (idle = v),
     setAbortMakesIdle: (v: boolean) => (abortMakesIdle = v),
+    aborts: () => aborts,
+    fire,
+    /** What Pi does when an injected message enters the model's context. */
+    emitMessageStart: (m: any) => fire("message_start", { type: "message_start", message: { role: "custom", ...m, timestamp: Date.now() } }),
     command: (args: string) => cmds.mayfly.handler(args, ctx),
-    call: (name: string, params: any) => tools[name].execute("id", params, undefined, undefined, ctx),
+    call: (name: string, params: any, signal?: AbortSignal) => tools[name].execute("id", params, signal, undefined, ctx),
     shutdown: () => fire("session_shutdown"),
   };
 }
@@ -97,9 +103,19 @@ describe("extension wiring against a local Mayfly server", { skip }, () => {
     await srv?.stop();
     rmSync(dir, { recursive: true, force: true });
   });
+  /** A raw client. Its post() retries on a conflict (the agent's receipts often land first), and fails loudly. */
   const open = (url: string, name: string): Channel => {
     const ch = openChannel(url, name);
     cleanup.push(() => ch.close());
+    const post = ch.post.bind(ch);
+    ch.post = async (text, opts) => {
+      for (let i = 0; i < 10; i++) {
+        const r = await post(text, opts);
+        if (r.posted === true) return r;
+        if (!r.conflict) throw new Error(`post failed: ${r.error}`);
+      }
+      throw new Error("post kept conflicting");
+    };
     return ch;
   };
   const pi = async (branch?: Entry[]) => {
@@ -232,5 +248,227 @@ describe("extension wiring against a local Mayfly server", { skip }, () => {
     assert.equal(P.stops().length, 0, "no stop note after leaving");
     const hist = await h.history(10);
     assert.ok(!hist.some((m) => m.text.startsWith("⏹")), "no ⏹ reply after leaving");
+  });
+
+  // --- v0.5: steer, receipts, busy notice, /interrupt ---------------------------------
+
+  const reactsBy = (msgs: { from: string; text: string }[], who: string, seq: number, emoji: string) =>
+    msgs.filter((m) => m.from === who && m.text === `/react ${seq} ${emoji}`).length;
+
+  test("addressed: 📬 at once while busy, steered delivery, 👀 only when the injection reaches the model", async () => {
+    const { url } = await createChannel(srv.origin);
+    const P = await pi();
+    await P.command(`join ${url} A -- testing`);
+    const h = open(url, "H");
+    await sleep(300);
+    P.setIdle(false);
+    const r = await h.post("@A please look at this");
+    await until(() => P.wakes().length === 1, 3000, "the wake");
+    const w = P.wakes()[0];
+    assert.deepEqual(w.o, { triggerTurn: true, deliverAs: "steer" });
+    assert.deepEqual(w.m.details.addressed, [r.id]);
+    let hist: { from: string; text: string }[] = [];
+    for (let i = 0; i < 30 && reactsBy(hist, "A", r.id!, "📬") < 1; i++) {
+      await sleep(100);
+      hist = await h.history(20);
+    }
+    assert.equal(reactsBy(hist, "A", r.id!, "📬"), 1);
+    await sleep(500);
+    hist = await h.history(20);
+    assert.equal(reactsBy(hist, "A", r.id!, "👀"), 0, "no 👀 before the model has it");
+    await P.emitMessageStart(w.m);
+    await P.emitMessageStart(w.m); // a repeat doesn't post twice
+    for (let i = 0; i < 30 && reactsBy(hist, "A", r.id!, "👀") < 1; i++) {
+      await sleep(100);
+      hist = await h.history(20);
+    }
+    await sleep(300);
+    hist = await h.history(20);
+    assert.equal(reactsBy(hist, "A", r.id!, "👀"), 1);
+    assert.equal(reactsBy(hist, "A", r.id!, "📬"), 1);
+  });
+
+  test("idle delivery triggers a turn without deliverAs; plain chat gets no receipts; receipts=false posts none", async () => {
+    const { url } = await createChannel(srv.origin);
+    const P = await pi();
+    await P.command(`join ${url} A -- testing`);
+    const off = profileFile("noreceipts", { receipts: false });
+    const Q = await pi();
+    await Q.command(`join ${url} Q --profile=${off} -- testing`);
+    const h = open(url, "H");
+    await sleep(300);
+    await h.post("just chatting, nobody in particular");
+    const r = await h.post("@A @Q ping");
+    await until(() => P.wakes().length === 1 && Q.wakes().length === 1, 3000, "the wakes");
+    assert.deepEqual(P.wakes()[0].o, { triggerTurn: true });
+    await P.emitMessageStart(P.wakes()[0].m);
+    await Q.emitMessageStart(Q.wakes()[0].m);
+    await sleep(1200);
+    const hist = await h.history(30);
+    const reacts = hist.filter((m) => m.text.startsWith("/react "));
+    // A: 📬 (possibly superseded by 👀 if not yet sent) and 👀 for #r only; Q: nothing; the chatter: nothing.
+    assert.ok(reacts.every((m) => m.from === "A" && m.text.startsWith(`/react ${r.id} `)), JSON.stringify(reacts));
+    assert.equal(reactsBy(hist, "A", r.id!, "👀"), 1);
+  });
+
+  test("waitFor: received resolves with the receipt; seen times out cleanly", async () => {
+    const { url } = await createChannel(srv.origin);
+    const A = await pi();
+    await A.command(`join ${url} A -- testing`);
+    const B = await pi();
+    await B.command(`join ${url} B -- testing`);
+    await sleep(500);
+    B.setIdle(false); // B is busy: it receives (📬) but its model doesn't see it
+    const t0 = Date.now();
+    const res = await A.call("mayfly_post", { text: "@B can you check the build?", waitFor: "received", timeoutSec: 10 });
+    const out = res.content[0].text;
+    assert.match(out, /^Posted #\d+\. 📬 B after \d+(\.\d)?s/, out);
+    assert.ok(Date.now() - t0 < 8000);
+    const res2 = await A.call("mayfly_post", { text: "@B and this one?", waitFor: "seen", timeoutSec: 1 });
+    const out2 = res2.content[0].text;
+    assert.match(out2, /📬 B after/, out2);
+    assert.match(out2, /no 👀 within 1s/, out2);
+    assert.equal(res2.isError, false, "a timeout is not an error");
+    // Status lists what is still missing a 👀.
+    const st = (await A.call("mayfly_status", {})).content[0].text;
+    assert.match(st, /awaiting receipts:/);
+    assert.match(st, /no 👀 from B/);
+    const rc = (await A.call("mayfly_receipts", {})).content[0].text;
+    assert.match(rc, /📬 B after/);
+    // Nobody running: no 📬 at all.
+    const res3 = await A.call("mayfly_post", { text: "@Ghost hello?", waitFor: "received", timeoutSec: 1 });
+    assert.match(res3.content[0].text, /no 📬 within 1s — the recipient may not be running/);
+  });
+
+  test("busy notice: posted once per sender while one tool call runs past the threshold", async () => {
+    const { url } = await createChannel(srv.origin);
+    const fast = profileFile("busy", { busyNoticeAfterSec: 0.2 });
+    const P = await pi();
+    await P.command(`join ${url} A --profile=${fast} -- testing`);
+    const h = open(url, "H");
+    const g = open(url, "G");
+    await sleep(300);
+    P.setIdle(false);
+    await P.fire("tool_execution_start", { type: "tool_execution_start", toolCallId: "c1", toolName: "bash", args: {} });
+    await sleep(400);
+    await h.post("@A one");
+    await sleep(400);
+    await h.post("@A two");
+    await g.post("@A from G");
+    await sleep(1500);
+    let notices = (await h.history(30)).filter((m) => m.text.startsWith("⏳"));
+    assert.equal(notices.length, 2, JSON.stringify(notices));
+    assert.match(notices[0].text, /^⏳ A got #\d+ but is busy \(bash, running \d+s\)\. It will read it after the current step; \/interrupt A <message> to break in\.$/);
+    assert.ok(notices.every((n) => !n.text.includes("@")));
+    // The tool ends and a new one starts: a new busy period.
+    await P.fire("tool_execution_end", { type: "tool_execution_end", toolCallId: "c1", toolName: "bash", result: {}, isError: false });
+    await P.fire("tool_execution_start", { type: "tool_execution_start", toolCallId: "c2", toolName: "edit", args: {} });
+    await sleep(400);
+    await h.post("@A three");
+    await sleep(1200);
+    notices = (await h.history(40)).filter((m) => m.text.startsWith("⏳"));
+    assert.equal(notices.length, 3);
+    assert.match(notices[2].text, /\(edit, running/);
+  });
+
+  test("/interrupt while busy: aborts, then wakes with triggerTurn and a resume note; ⚡ reply", async () => {
+    const { url } = await createChannel(srv.origin);
+    const P = await pi();
+    await P.command(`join ${url} A -- testing`);
+    const h = open(url, "H");
+    await sleep(300);
+    P.setIdle(false);
+    await P.fire("tool_execution_start", { type: "tool_execution_start", toolCallId: "c1", toolName: "bash", args: {} });
+    const r = await h.post("/interrupt A the API changed, stop editing client.ts");
+    await until(() => P.wakes().length === 1, 4000, "the urgent wake");
+    assert.equal(P.aborts(), 1);
+    const w = P.wakes()[0];
+    assert.equal(w.o.triggerTurn, true);
+    assert.match(w.m.content, /H interrupted your current work via Mayfly \(#\d+\): the API changed, stop editing client\.ts/);
+    assert.match(w.m.content, /Decide whether to resume the interrupted work/);
+    assert.deepEqual(w.m.details.addressed, [r.id]);
+    await P.emitMessageStart(w.m);
+    let hist: { from: string; text: string }[] = [];
+    for (let i = 0; i < 30; i++) {
+      hist = await h.history(20);
+      if (hist.some((m) => m.text.includes("⚡")) && reactsBy(hist, "A", r.id!, "👀")) break;
+      await sleep(100);
+    }
+    assert.ok(hist.some((m) => m.from === "A" && new RegExp(`^/re ${r.id} ⚡ A interrupted \\(was running bash, \\d+s\\) — handling #${r.id}$`).test(m.text)), JSON.stringify(hist));
+    assert.equal(reactsBy(hist, "A", r.id!, "👀"), 1);
+    assert.equal(P.stops().length, 0);
+  });
+
+  test("/interrupt while idle: a normal wake, even when the budget is paused; mayfly_interrupt quotes names", async () => {
+    const { url } = await createChannel(srv.origin);
+    const paused = profileFile("pause2", { budget: { hourlyCap: 1, quietResumeMinutes: 60 } });
+    const P = await pi();
+    await P.command(`join ${url} Pi Bot --profile=${paused} -- testing`);
+    const S = await pi();
+    await S.command(`join ${url} S -- testing`);
+    const h = open(url, "H");
+    await sleep(400);
+    await h.post("@Pi Bot one");
+    await until(() => P.wakes().length === 1, 3000, "first wake");
+    await h.post("@Pi Bot two (held)");
+    await until(() => P.notes.some((n) => /auto-wake paused/.test(n)), 3000, "the pause");
+    let res: any;
+    for (let i = 0; i < 5; i++) {
+      res = await S.call("mayfly_interrupt", { target: "Pi Bot", message: "urgent: check prod" });
+      if (!/^Conflict/.test(res.content[0].text)) break; // a real agent would reconsider and retry too
+    }
+    assert.equal(res.isError, false, res.content[0].text);
+    await until(() => P.wakes().length === 2, 4000, "the urgent wake despite the pause");
+    assert.equal(P.aborts(), 0);
+    const w = P.wakes()[1];
+    assert.deepEqual(w.o, { triggerTurn: true });
+    assert.match(w.m.content, /S sent you an urgent message via Mayfly \(#\d+\): urgent: check prod/);
+    assert.match(w.m.content, /two \(held\)/);
+    const hist = await h.history(20);
+    assert.ok(hist.some((m) => m.from === "S" && m.text === '/interrupt "Pi Bot" urgent: check prod'));
+    for (let i = 0; i < 30 && !(await h.history(20)).some((m) => /⚡ Pi Bot was idle — handling #/.test(m.text)); i++) await sleep(100);
+    assert.ok((await h.history(20)).some((m) => /⚡ Pi Bot was idle — handling #/.test(m.text)));
+  });
+
+  test("a disallowed /interrupt doesn't abort or cancel a pending (throttled) wake", async () => {
+    const { url } = await createChannel(srv.origin);
+    const fast = profileFile("fast3", { budget: { burst: 1, refillPerMinute: 20 } });
+    const P = await pi();
+    await P.command(`join ${url} A --profile=${fast} --no-stop -- testing`);
+    const h = open(url, "H");
+    await sleep(300);
+    await h.post("@A task 0");
+    await until(() => P.wakes().length === 1, 3000, "first wake");
+    P.setIdle(false);
+    await h.post("@A task 1"); // throttled: retry scheduled
+    await sleep(400);
+    await h.post("/interrupt A drop everything");
+    await until(() => P.wakes().length === 2, 6000, "the throttled wake despite the disallowed /interrupt");
+    assert.equal(P.aborts(), 0);
+    assert.match(P.wakes()[1].m.content, /task 1/);
+    assert.doesNotMatch(P.wakes()[1].m.content, /interrupted your current work/);
+    const hist = await h.history(20);
+    assert.ok(hist.some((m) => m.from === "A" && /⛔ ignoring \/interrupt from "H" — not allowed to interrupt A/.test(m.text)));
+    assert.equal(reactsBy(hist, "A", hist.find((m) => m.text.startsWith("/interrupt"))!.seq, "📬"), 0, "no receipt for a disallowed interrupt");
+  });
+
+  test("a steered wake lost to an abort is delivered again after the run ends", async () => {
+    const { url } = await createChannel(srv.origin);
+    const P = await pi();
+    await P.command(`join ${url} A -- testing`);
+    const h = open(url, "H");
+    await sleep(300);
+    P.setIdle(false);
+    await h.post("@A important");
+    await until(() => P.wakes().length === 1, 3000, "the steered wake");
+    // The run is aborted before the steer is processed (no message_start), then ends.
+    P.setIdle(true);
+    await P.fire("agent_end", { type: "agent_end", messages: [] });
+    await until(() => P.wakes().length === 2, 3000, "the redelivery");
+    assert.match(P.wakes()[1].m.content, /@A important/);
+    await P.emitMessageStart(P.wakes()[1].m);
+    await P.fire("agent_end", { type: "agent_end", messages: [] });
+    await sleep(1500);
+    assert.equal(P.wakes().length, 2, "a seen wake is not redelivered");
   });
 });
