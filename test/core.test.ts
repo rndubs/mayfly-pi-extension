@@ -62,6 +62,10 @@ test("parseStop", () => {
   assert.equal(parseStop("please /stop PiLive"), null);
   assert.equal(parseStop("/stop"), null);
   assert.equal(parseStop("/stopper PiLive"), null);
+  // Names with spaces are double-quoted.
+  assert.deepEqual(parseStop('/stop "Pi Bot" go home'), { target: "Pi Bot", reason: "go home" });
+  assert.deepEqual(parseStop('/stop @"Pi Bot"'), { target: "Pi Bot", reason: undefined });
+  assert.deepEqual(parseStop("/stop Pi Bot"), { target: "Pi", reason: "Bot" });
 });
 
 test("openChannel URL parsing", () => {

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.4.1 — unreleased
+
+Fixes from a code review of 0.3/0.4.
+
+- **`/re` on resume.** A `/re` to one of the agent's messages that arrived while Pi was closed now wakes it.
+  On resume, the backlog is held (up to 5 s) until history has told the extension which seqs are its own.
+- **Disallowed `/stop`.** A `/stop` that `allowStop` / `--no-stop` doesn't permit no longer cancels a pending
+  (throttled) wake. It gets the `⛔ ignoring` reply and is recorded like any other message.
+- **Budget pause resumes by itself.** After a pause, auto-wake now resumes once `quietResumeMinutes` pass
+  with no addressed messages, and delivers what was held, without waiting for a new addressed message.
+- **Mention matching.** A name runs through letters, digits, `_` and `-`: `@code-bot` no longer wakes `code`,
+  `@rev-team` no longer matches group `rev`, and `@all-hands` no longer counts as `@all`. With
+  `requireAtForMention: false`, `bob@example.com` no longer matches `bob`.
+- **Bounded addressed buffer.** Addressed messages held between wakes are capped at 200 (newest kept); drops
+  are counted in the "omitted" note.
+- **No wake for chatter after `mayfly_read`.** Reading history that covers every addressed message no longer
+  leaves a wake owed for the remaining non-addressed messages (under `wake: addressed`).
+- **Cursor per channel.** The saved resume cursor now records its channel id, and a later join resets it, so a
+  rejoin never resumes channel B from channel A's position.
+- **`/stop` after leave.** A `/stop` still settling when the channel is left or the session shuts down no
+  longer posts or records anything afterward.
+- **Wake message truncation.** A line exactly as long as the remaining room is shown truncated instead of
+  dropped.
+- **`/stop` with spaced names.** `/stop "Pi Bot" [reason]` targets a name with spaces; `mayfly_stop` quotes such
+  names.
+- Docs: two agents replying to each other with `/re` wake each other every turn, bounded only by the budget.
+
 ## 0.4.0 — unreleased
 
 - **Join intro with the agent's task.** An explicit join posts `👋 <name> joined. Working on: <task>` and how to

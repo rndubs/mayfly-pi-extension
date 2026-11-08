@@ -161,11 +161,11 @@ export function openEvent(keys: ChannelKeys, ev: any): MayflyMessage {
 
 /**
  * Parse the `/stop <name|all> [reason]` chat convention (handled by the watcher, not the model).
- * Returns null for anything else.
+ * A name with spaces must be double-quoted: `/stop "Pi Bot" reason`. Returns null for anything else.
  */
 export function parseStop(text: string): { target: string; reason?: string } | null {
-  const m = /^\/stop\s+@?(\S+)(?:\s+([\s\S]*\S))?\s*$/i.exec(text);
-  return m ? { target: m[1], reason: m[2] } : null;
+  const m = /^\/stop\s+(?:@?"([^"]+)"|@?(\S+))(?:\s+([\s\S]*\S))?\s*$/i.exec(text);
+  return m ? { target: m[1] ?? m[2], reason: m[3] } : null;
 }
 
 export function openChannel(url: string, name: string): Channel {

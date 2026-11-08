@@ -9,7 +9,9 @@ import {
   mentions,
   parseReplyTarget,
   stopTargetsMe,
+  TRUST_NOTE,
   truncateBytes,
+  PENDING_MAX,
   UNSEEN_MAX,
   WakeBudget,
 } from "../policy.ts";
@@ -33,6 +35,31 @@ test("mentions: @-prefixed, case-insensitive, word-bounded", () => {
   assert.equal(mentions("@Pi-2 go", "Pi-2"), true);
   assert.equal(mentions("@Pi-2x go", "Pi-2"), false);
   assert.equal(mentions("hi @Ünï!", "ünï"), true);
+});
+
+test("mentions: a name continues through - and _; @-suffixes and emails don't match", () => {
+  assert.equal(mentions("@code-bot please run", "code"), false);
+  assert.equal(mentions("@code_bot please run", "code"), false);
+  assert.equal(mentions("@code-bot please run", "code-bot"), true);
+  assert.equal(mentions("@all-hands meeting", "all"), false);
+  assert.equal(mentions("@rev-team look", "rev"), false);
+  assert.equal(mentions("@Pi.dev is a site", "Pi"), false);
+  assert.equal(mentions("mail bob@example.com", "bob", false), false);
+  assert.equal(mentions("@bob@example.com", "bob"), false);
+  assert.equal(mentions("set up pi-hole", "Pi", false), false);
+  assert.equal(mentions("x-bob said", "bob", false), false);
+  // Ordinary punctuation still ends a mention.
+  for (const t of ["thanks @Pi.", "@Pi, look", "@Pi: look", "(@Pi)", "@Pi!", "@Pi? ok", "@Pi's turn"]) assert.equal(mentions(t, "Pi"), true, t);
+  assert.equal(mentions("bob, look", "bob", false), true);
+  assert.equal(mentions("@Pi Bot hi", "Pi Bot"), true);
+});
+
+test("decideWake: @all-hands and @rev-team don't wake @all or group rev", () => {
+  const p = prof({ groups: ["rev"] });
+  assert.equal(decideWake(msg("H", "@all-hands meeting"), state("A"), p).wake, false);
+  assert.equal(decideWake(msg("H", "@rev-team look"), state("A"), p).wake, false);
+  assert.equal(decideWake(msg("H", "@code-bot run"), state("code"), p).wake, false);
+  assert.equal(decideWake(msg("H", "@rev look"), state("A"), p).wake, true);
 });
 
 test("parseReplyTarget", () => {
@@ -130,19 +157,19 @@ test("buildWakeMessage: huge backlog stays under maxBytes; long messages truncat
 test("WakeBudget: burst, refill, hourly cap pause, quiet resume, manual resume", () => {
   let now = 0;
   const b = new WakeBudget({ burst: 3, refillPerMinute: 1, hourlyCap: 5, quietResumeMinutes: 10 }, () => now);
-  for (let i = 0; i < 3; i++) assert.deepEqual(b.tryWake(), { allowed: true });
+  for (let i = 0; i < 3; i++) assert.deepEqual(b.tryWake(), { allowed: true, resumed: false });
   const t = b.tryWake();
   assert.equal(t.allowed, false);
   assert.equal(t.allowed === false && t.reason, "throttled");
   assert.ok(t.allowed === false && t.reason === "throttled" && t.retryInMs === 60_000);
   now += 60_000;
-  assert.deepEqual(b.tryWake(), { allowed: true });
+  assert.deepEqual(b.tryWake(), { allowed: true, resumed: false });
   now += 60_000;
-  assert.deepEqual(b.tryWake(), { allowed: true }); // 5 wakes this hour
+  assert.deepEqual(b.tryWake(), { allowed: true, resumed: false }); // 5 wakes this hour
   now += 120_000;
   b.noteAddressed();
-  assert.deepEqual(b.tryWake(), { allowed: false, reason: "paused", justPaused: true });
-  assert.deepEqual(b.tryWake(), { allowed: false, reason: "paused", justPaused: false });
+  assert.deepEqual(b.tryWake(), { allowed: false, reason: "paused", justPaused: true, retryInMs: 600_000 });
+  assert.deepEqual(b.tryWake(), { allowed: false, reason: "paused", justPaused: false, retryInMs: 600_000 });
   assert.equal(b.state().paused, true);
   now += 5 * 60_000;
   assert.equal(b.noteAddressed(), false, "not quiet long enough");
@@ -150,7 +177,7 @@ test("WakeBudget: burst, refill, hourly cap pause, quiet resume, manual resume",
   assert.equal(b.noteAddressed(), false, "the previous message reset the quiet timer");
   now += 10 * 60_000;
   assert.equal(b.noteAddressed(), true, "quiet resume");
-  assert.deepEqual(b.tryWake(), { allowed: true });
+  assert.deepEqual(b.tryWake(), { allowed: true, resumed: false });
   // Manual resume.
   for (let i = 0; i < 2; i++) b.tryWake();
   now += 3 * 60_000;
@@ -159,7 +186,26 @@ test("WakeBudget: burst, refill, hourly cap pause, quiet resume, manual resume",
   b.resume();
   assert.equal(b.state().paused, false);
   assert.equal(b.state().wakesLastHour, 0);
-  assert.deepEqual(b.tryWake(), { allowed: true });
+  assert.deepEqual(b.tryWake(), { allowed: true, resumed: false });
+});
+
+test("WakeBudget: a pause reports when quiet resume is possible and resumes on the next try", () => {
+  let now = 0;
+  const b = new WakeBudget({ burst: 100, refillPerMinute: 100, hourlyCap: 1, quietResumeMinutes: 10 }, () => now);
+  b.noteAddressed();
+  assert.deepEqual(b.tryWake(), { allowed: true, resumed: false });
+  now += 60_000;
+  b.noteAddressed();
+  assert.deepEqual(b.tryWake(), { allowed: false, reason: "paused", justPaused: true, retryInMs: 600_000 });
+  assert.equal(b.resumeAt, 660_000);
+  now += 4 * 60_000;
+  assert.equal(b.msUntilResume(), 360_000);
+  assert.deepEqual(b.tryWake(), { allowed: false, reason: "paused", justPaused: false, retryInMs: 360_000 });
+  now += 6 * 60_000;
+  assert.equal(b.msUntilResume(), 0);
+  assert.deepEqual(b.tryWake(), { allowed: true, resumed: true });
+  assert.equal(b.isPaused, false);
+  assert.equal(b.resumeAt, undefined);
 });
 
 test("WakeBudget: rolling hour forgets old wakes", () => {
@@ -168,7 +214,7 @@ test("WakeBudget: rolling hour forgets old wakes", () => {
   b.tryWake();
   b.tryWake();
   now += 3_600_001;
-  assert.deepEqual(b.tryWake(), { allowed: true });
+  assert.deepEqual(b.tryWake(), { allowed: true, resumed: false });
 });
 
 test("Inbox: addressed wakes, others are recorded and delivered once as context", () => {
@@ -225,9 +271,9 @@ test("Inbox: hard cap pauses once, resume() re-enables", () => {
     assert.equal(ib.attempt("H").kind, "wake");
   }
   ib.add([msg("B", "@A ping")]);
-  assert.deepEqual(ib.attempt("H"), { kind: "paused", justPaused: true });
+  assert.deepEqual(ib.attempt("H"), { kind: "paused", justPaused: true, retryInMs: 600_000 });
   ib.add([msg("B", "@A ping again")]);
-  assert.deepEqual(ib.attempt("H"), { kind: "paused", justPaused: false });
+  assert.deepEqual(ib.attempt("H"), { kind: "paused", justPaused: false, retryInMs: 600_000 });
   ib.resume();
   const w = ib.attempt("H");
   assert.equal(w.kind, "wake");
@@ -273,4 +319,81 @@ test("Inbox: markSeen drops only the range read", () => {
   ib.add([msg("B", "a", 1), msg("B", "b", 2), msg("B", "c", 3)]);
   ib.markSeen(2, 3);
   assert.deepEqual(ib.unseen.map((m) => m.seq), [1]);
+});
+
+test("Inbox: a budget pause resumes after the quiet period and delivers what was held", () => {
+  let now = 0;
+  const ib = new Inbox(prof({ budget: { hourlyCap: 2, burst: 6, quietResumeMinutes: 10 } }), state(), () => now);
+  for (let i = 0; i < 2; i++) {
+    ib.add([msg("H", `@A go ${i}`)]);
+    assert.equal(ib.attempt("h").kind, "wake");
+    now += 1000;
+  }
+  ib.add([msg("H", "@A held"), msg("H", "chatter")]);
+  const p = ib.attempt("h");
+  assert.equal(p.kind, "paused");
+  // The caller schedules a retry for when quiet resume is possible.
+  assert.ok(p.kind === "paused" && p.justPaused && p.retryInMs === 600_000);
+  now += 600_000;
+  const w = ib.attempt("h");
+  assert.equal(w.kind, "wake");
+  if (w.kind === "wake") {
+    assert.equal(w.resumed, true);
+    assert.match(w.content, /has now resumed/);
+    assert.match(w.content, /@A held/);
+    assert.match(w.content, /chatter/);
+  }
+  assert.equal(ib.budget.isPaused, false);
+  assert.equal(ib.unseenCount, 0);
+});
+
+test("Inbox: addressed buffer is bounded; drops are counted in the omitted note", () => {
+  const ib = new Inbox(prof({ wake: "none" }), state());
+  for (let i = 0; i < PENDING_MAX + 50; i++) ib.add([msg("H", `@all ping ${i}`, 10_000 + i)]);
+  assert.equal(ib.pending.length, PENDING_MAX);
+  assert.equal(ib.droppedAddressed, 50);
+  assert.equal(ib.pending[0].text, "@all ping 50", "newest kept");
+  assert.equal(ib.unseenCount, PENDING_MAX + 50);
+  const r = ib.take("H");
+  assert.equal(r.omitted, PENDING_MAX + 50 - r.shownAddressed);
+  assert.match(r.content, new RegExp(`Addressed to you \\(${PENDING_MAX + 50}\\)`));
+  assert.match(r.content, new RegExp(`${PENDING_MAX + 50 - r.shownAddressed} earlier addressed message\\(s\\) omitted`));
+  assert.equal(ib.unseenCount, 0);
+});
+
+test("Inbox: markSeen of the addressed messages leaves no wake owed for chatter", () => {
+  const ib = new Inbox(prof(), state());
+  ib.add([msg("H", "chatter", 10)]);
+  assert.equal(ib.add([msg("H", "@A do x", 50)]), true);
+  ib.markSeen(31, 50);
+  assert.equal(ib.wantsWake(), false);
+  assert.equal(ib.attempt("h").kind, "none");
+  assert.equal(ib.unseenCount, 1, "chatter is still recorded");
+  // An addressed message outside the range keeps the wake owed.
+  const ib2 = new Inbox(prof(), state());
+  ib2.add([msg("H", "@A one", 10), msg("H", "@A two", 50)]);
+  ib2.markSeen(31, 50);
+  assert.equal(ib2.wantsWake(), true);
+  // wake=all: anything left keeps it owed.
+  const ib3 = new Inbox(prof({ wake: "all" }), state());
+  ib3.add([msg("H", "a", 10), msg("H", "b", 50)]);
+  ib3.markSeen(31, 50);
+  assert.equal(ib3.wantsWake(), true);
+  ib3.markSeen(0, 30);
+  assert.equal(ib3.wantsWake(), false);
+});
+
+test("buildWakeMessage: a line exactly as long as the remaining room is shown truncated, not dropped", () => {
+  const header = "H";
+  const footer = "F";
+  const maxBytes = 700;
+  const room = maxBytes - (bytes([header, TRUST_NOTE].join("\n")) + bytes(footer) + 400);
+  assert.ok(room > 100 && room < 256, `room=${room}`);
+  const prefix = "[#7 B] ";
+  const m = { seq: 7, ts: "t", src: "s", from: "B", text: "x".repeat(room - bytes(prefix)) };
+  const w = buildWakeMessage({ addressed: [m], other: [], recentK: 10, maxBytes, header, footer });
+  assert.equal(w.shownAddressed, 1);
+  assert.equal(w.omitted, 0);
+  assert.match(w.content, /\[#7 B\] x+ … \[truncated/);
+  assert.ok(bytes(w.content) <= maxBytes);
 });

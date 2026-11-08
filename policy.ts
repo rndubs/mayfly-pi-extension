@@ -27,15 +27,21 @@ type WakeProfile = Pick<Profile, "wake" | "groups" | "requireAtForMention">;
 
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+/** Characters that can be part of a name or group tag in a mention. */
+const NAME_CH = "\\p{L}\\p{N}_\\-";
+
 /**
  * True if `text` mentions `token` as a whole word: `@token` always; bare `token` only if !requireAt.
- * Case-insensitive. Not preceded by a letter/digit/_/@/. (so emails don't match) and not followed by a
- * letter/digit/_ (so `@Pi` doesn't match `@Pipeline`).
+ * Case-insensitive. A mention starts after a character that can't be part of a name (or `@`/`.`, so emails
+ * don't match) and ends only where the name can't continue: not before a letter, digit, `_` or `-` (so `@Pi`
+ * doesn't match `@Pipeline`, `@code` doesn't match `@code-bot`, `@all` doesn't match `@all-hands`), not
+ * before `@` (so bare `bob` doesn't match `bob@example.com`), and not before a `.` that continues the word
+ * (`@Pi.dev`). Trailing punctuation such as `@Pi.` or `@Pi,` still matches.
  */
 export function mentions(text: string, token: string, requireAt = true): boolean {
   if (!token) return false;
   const at = requireAt ? "@" : "@?";
-  return new RegExp(`(?<![\\p{L}\\p{N}_@.])${at}${escapeRe(token)}(?![\\p{L}\\p{N}_])`, "iu").test(text);
+  return new RegExp(`(?<![${NAME_CH}@.])${at}${escapeRe(token)}(?![${NAME_CH}@])(?!\\.[${NAME_CH}])`, "iu").test(text);
 }
 
 /** `/re N text` → N. */
@@ -80,9 +86,11 @@ export function stopTargetsMe(target: string, name: string, groups: readonly str
 // --- budget ------------------------------------------------------------------
 
 export type BudgetResult =
-  | { allowed: true }
+  /** `resumed`: a quiet-period auto-resume happened just before this wake. */
+  | { allowed: true; resumed: boolean }
   | { allowed: false; reason: "throttled"; retryInMs: number }
-  | { allowed: false; reason: "paused"; justPaused: boolean };
+  /** `retryInMs`: when the quiet rule next allows an auto-resume (if no addressed message arrives first). */
+  | { allowed: false; reason: "paused"; justPaused: boolean; retryInMs: number };
 
 export interface BudgetState {
   tokens: number;
@@ -131,23 +139,37 @@ export class WakeBudget {
    * for quietResumeMinutes, auto-resume first. Returns true if this call resumed.
    */
   noteAddressed(): boolean {
-    const t = this.now();
-    let resumed = false;
-    if (this.paused && t - this.lastAddressed >= this.cfg.quietResumeMinutes * 60_000) {
-      this.resume();
-      resumed = true;
-    }
-    this.lastAddressed = t;
+    const resumed = this.quietResume();
+    this.lastAddressed = this.now();
     return resumed;
   }
 
-  /** Try to spend one wake. */
+  /** Earliest time (ms epoch) the quiet rule allows an auto-resume, if paused. */
+  get resumeAt(): number | undefined {
+    return this.paused ? this.lastAddressed + this.cfg.quietResumeMinutes * 60_000 : undefined;
+  }
+
+  /** Milliseconds until a quiet auto-resume is possible (0 if possible now or not paused). */
+  msUntilResume(): number {
+    const at = this.resumeAt;
+    return at === undefined ? 0 : Math.max(0, at - this.now());
+  }
+
+  /** If paused and the channel has been quiet long enough, resume. Returns true if this call resumed. */
+  private quietResume(): boolean {
+    if (!this.paused || this.now() < this.resumeAt!) return false;
+    this.resume();
+    return true;
+  }
+
+  /** Try to spend one wake. A pause whose quiet period has elapsed resumes first. */
   tryWake(): BudgetResult {
+    const resumed = this.quietResume();
     this.refill();
-    if (this.paused) return { allowed: false, reason: "paused", justPaused: false };
+    if (this.paused) return { allowed: false, reason: "paused", justPaused: false, retryInMs: this.msUntilResume() };
     if (this.wakes.length >= this.cfg.hourlyCap) {
       this.paused = true;
-      return { allowed: false, reason: "paused", justPaused: true };
+      return { allowed: false, reason: "paused", justPaused: true, retryInMs: this.msUntilResume() };
     }
     if (this.tokens < 1) {
       const rate = this.cfg.refillPerMinute;
@@ -156,7 +178,7 @@ export class WakeBudget {
     }
     this.tokens -= 1;
     this.wakes.push(this.now());
-    return { allowed: true };
+    return { allowed: true, resumed };
   }
 
   /** Manual or quiet resume: clear the pause and the hourly window, refill the bucket. */
@@ -179,7 +201,7 @@ export class WakeBudget {
       wakesLastHour: this.wakes.length,
       hourlyCap: this.cfg.hourlyCap,
       paused: this.paused,
-      resumeAfter: this.paused ? this.lastAddressed + this.cfg.quietResumeMinutes * 60_000 : undefined,
+      resumeAfter: this.resumeAt,
     };
   }
 }
@@ -218,6 +240,8 @@ export interface WakeMessageInput {
   other: MayflyMessage[];
   /** Unseen messages already dropped from the buffer before this call. */
   droppedEarlier?: number;
+  /** Addressed messages already dropped from the buffer before this call. */
+  droppedAddressedEarlier?: number;
   recentK: number;
   maxBytes: number;
   /** First line, e.g. "Mayfly on https://host/c/ID (you are "A")." */
@@ -252,7 +276,8 @@ export function buildWakeMessage(inp: WakeMessageInput): WakeMessage {
   const take = (msgs: MayflyMessage[], limit: number) => {
     const picked: string[] = [];
     for (let i = msgs.length - 1; i >= 0 && picked.length < limit; i--) {
-      const line = formatLine(msgs[i], Math.min(perLine, room));
+      // Each line costs its bytes plus a newline: cut it to fit both.
+      const line = formatLine(msgs[i], Math.min(perLine, room - 1));
       const b = byteLen(line) + 1;
       if (b > room || room <= 0) break;
       picked.unshift(line);
@@ -263,17 +288,18 @@ export function buildWakeMessage(inp: WakeMessageInput): WakeMessage {
 
   const a = take(inp.addressed, Infinity);
   const o = take(inp.other, Math.max(0, inp.recentK));
-  const omittedAddressed = inp.addressed.length - a.length;
+  const omittedAddressed = inp.addressed.length - a.length + (inp.droppedAddressedEarlier ?? 0);
   const omittedOther = inp.other.length - o.length + (inp.droppedEarlier ?? 0);
 
   const parts = [head];
-  if (inp.addressed.length) {
-    parts.push("", inp.addressed.length === 1 ? "Addressed to you:" : `Addressed to you (${inp.addressed.length}):`);
+  const nAddressed = inp.addressed.length + (inp.droppedAddressedEarlier ?? 0);
+  if (nAddressed) {
+    parts.push("", nAddressed === 1 ? "Addressed to you:" : `Addressed to you (${nAddressed}):`);
     if (omittedAddressed) parts.push(`(${omittedAddressed} earlier addressed message(s) omitted; use mayfly_read to see them)`);
     parts.push(...a);
   }
   if (o.length || omittedOther) {
-    parts.push("", inp.addressed.length ? "While you were away (not addressed to you):" : "New messages:");
+    parts.push("", nAddressed ? "While you were away (not addressed to you):" : "New messages:");
     if (omittedOther) parts.push(`(${omittedOther} earlier message(s) omitted; use mayfly_read to see them)`);
     parts.push(...o);
   }
@@ -296,10 +322,12 @@ export type WakeAction =
   | { kind: "none" }
   | { kind: "wake"; content: string; addressed: number; other: number; omitted: number; resumed: boolean }
   | { kind: "throttled"; retryInMs: number }
-  | { kind: "paused"; justPaused: boolean };
+  | { kind: "paused"; justPaused: boolean; retryInMs: number };
 
 /** Max unseen messages kept between wakes; older ones are counted as omitted. */
 export const UNSEEN_MAX = 200;
+/** Max addressed messages kept between wakes; older ones are counted as omitted. */
+export const PENDING_MAX = 200;
 
 /**
  * Per-channel buffer and wake decision. Not thread-safe (single JS thread). The caller
@@ -307,11 +335,14 @@ export const UNSEEN_MAX = 200;
  * a one-time chat notice on a fresh "paused".
  */
 export class Inbox {
-  /** Addressed messages not yet delivered (always delivered in full, subject to byte caps). */
+  /** Addressed messages not yet delivered (newest PENDING_MAX kept; shown first, subject to byte caps). */
   pending: MayflyMessage[] = [];
-  /** Non-addressed messages not yet delivered (bounded). */
+  /** Non-addressed messages not yet delivered (newest UNSEEN_MAX kept). */
   unseen: MayflyMessage[] = [];
+  /** Non-addressed messages dropped from `unseen` since the last delivery. */
   dropped = 0;
+  /** Addressed messages dropped from `pending` since the last delivery. */
+  droppedAddressed = 0;
   /** wake=all: a wake is owed even with no addressed messages. */
   private wakeOwed = false;
   private resumedNote = false;
@@ -334,7 +365,7 @@ export class Inbox {
   add(msgs: MayflyMessage[]): boolean {
     for (const m of msgs) {
       // Addressed messages are kept apart (and shown first) under every policy, even `none`.
-      if (addressedReason(m, this.state, this.profile)) this.pending.push(m);
+      if (addressedReason(m, this.state, this.profile)) this.pushPending(m);
       else this.pushUnseen(m);
       if (decideWake(m, this.state, this.profile).wake) {
         if (this.budget.noteAddressed()) this.resumedNote = true;
@@ -342,6 +373,15 @@ export class Inbox {
       }
     }
     return this.wantsWake();
+  }
+
+  private pushPending(m: MayflyMessage) {
+    this.pending.push(m);
+    if (this.pending.length > PENDING_MAX) {
+      const n = this.pending.length - PENDING_MAX;
+      this.pending.splice(0, n);
+      this.droppedAddressed += n;
+    }
   }
 
   private pushUnseen(m: MayflyMessage) {
@@ -361,8 +401,11 @@ export class Inbox {
   attempt(header: string): WakeAction {
     if (!this.wantsWake()) return { kind: "none" };
     const b = this.budget.tryWake();
-    if (!b.allowed) return b.reason === "throttled" ? { kind: "throttled", retryInMs: b.retryInMs } : { kind: "paused", justPaused: b.justPaused };
-    const resumed = this.resumedNote;
+    if (!b.allowed)
+      return b.reason === "throttled"
+        ? { kind: "throttled", retryInMs: b.retryInMs }
+        : { kind: "paused", justPaused: b.justPaused, retryInMs: b.retryInMs };
+    const resumed = this.resumedNote || b.resumed;
     const notes = resumed ? ["(Auto-wake had been paused by the wake budget and has now resumed.)"] : [];
     const msg = this.take(header, notes);
     return { kind: "wake", content: msg.content, addressed: msg.shownAddressed, other: msg.shownOther, omitted: msg.omitted, resumed };
@@ -374,6 +417,7 @@ export class Inbox {
       addressed: this.pending,
       other: this.unseen,
       droppedEarlier: this.dropped,
+      droppedAddressedEarlier: this.droppedAddressed,
       recentK: this.profile.context.recentK,
       maxBytes: this.profile.context.maxBytes,
       header,
@@ -391,14 +435,17 @@ export class Inbox {
     this.unseen = this.unseen.filter(keep);
     if (!this.pending.length && !this.unseen.length) {
       this.dropped = 0;
-      this.wakeOwed = false;
+      this.droppedAddressed = 0;
     }
+    // A wake is still owed only for what remains: an addressed message, or (wake=all) anything at all.
+    this.wakeOwed &&= this.pending.length > 0 || (this.profile.wake === "all" && this.unseen.length > 0);
   }
 
   clear() {
     this.pending = [];
     this.unseen = [];
     this.dropped = 0;
+    this.droppedAddressed = 0;
     this.wakeOwed = false;
     this.resumedNote = false;
   }
@@ -408,6 +455,6 @@ export class Inbox {
   }
 
   get unseenCount() {
-    return this.pending.length + this.unseen.length + this.dropped;
+    return this.pending.length + this.unseen.length + this.dropped + this.droppedAddressed;
   }
 }
