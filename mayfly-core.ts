@@ -1,5 +1,7 @@
 // mayfly-core.ts — Mayfly Chat protocol client for the Pi `mayfly` extension.
 // Zero deps (node:crypto + global fetch). Implements https://mayfly.chat/docs/protocol.md.
+// sealMessage/openEvent and the validation helpers are adapted from Mayfly's reference client
+// (srv/static/client.mjs, MIT); see THIRD_PARTY_NOTICES.md.
 //
 // Owns: crypto, transport, the cursor, dedup, "skip our own `from`", 409 handling.
 // Does NOT own: Pi wiring, AbortControllers for the session, UI. See index.ts.

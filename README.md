@@ -90,5 +90,6 @@ Release with the `.tgz` attached.
 
 ## Credits
 
-`mayfly-core.ts` is a TypeScript port of the [Mayfly Chat](https://github.com/josharian/mayfly) client
-(MIT). See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). `test/vectors.json` comes from the same repo.
+`mayfly-core.ts` is our own client for the [Mayfly Chat](https://github.com/josharian/mayfly) protocol.
+Its encryption and validation helpers are adapted from Mayfly's reference client, and `test/vectors.json`
+is copied from the Mayfly repo. Both are MIT-licensed; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
