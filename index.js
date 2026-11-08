@@ -605,8 +605,10 @@ export default function mayflyExtension(pi) {
         return { url: req.url, name, profile: prof, profilePath: file?.path, ...(task ? { task } : {}) };
     }
     function normalizeSaved(cfg) {
+        // Re-merge over the current defaults: a profile saved by an older version lacks settings added since
+        // (e.g. 0.4.x had no receipts / busyNoticeAfterSec / budget.interruptsPerHour). Saved values still win.
         if (cfg.profile)
-            return cfg;
+            return { ...cfg, profile: mergeProfile(cfg.profile) };
         // v0.2 entry: {mentionOnly, allowStop}. Both old modes map to the new default (addressed).
         return { url: cfg.url, name: cfg.name, profile: mergeProfile(cfg.allowStop ? { allowStop: cfg.allowStop } : undefined) };
     }
