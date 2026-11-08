@@ -103,20 +103,22 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     return allow.some((n) => n.toLowerCase() === from.toLowerCase());
   }
 
-  /** Abort the running turn (bash kills its process tree on abort), then record why. */
+  /**
+   * Abort the running turn (bash kills its process tree on abort), then record why. The caller has already
+   * checked stopAllowed(). If the channel is left, closed, or the session shuts down while waiting for the
+   * aborted run to settle, nothing more is recorded or posted.
+   */
   async function handleStop(m: MayflyMessage, reason: string | undefined) {
     const ctx = sessionCtx;
     const ch = channel;
     if (!ctx || !ch) return;
-    if (!stopAllowed(m.from)) {
-      void ch.post(`⛔ ignoring /stop from "${m.from || "?"}" — not allowed to stop ${ch.name}`, { replyTo: m.seq });
-      return;
-    }
+    const stale = () => channel !== ch || sessionCtx !== ctx;
     const wasBusy = !ctx.isIdle();
     if (wasBusy) ctx.abort();
     ctx.ui.notify(`Mayfly: ${wasBusy ? "stopped" : "stop requested"} by ${m.from} (#${m.seq})${reason ? ` — ${reason}` : ""}`, "warning");
     // Wait (bounded) for the aborted run to settle before recording the stop.
-    for (let i = 0; i < 50 && !ctx.isIdle(); i++) await new Promise((r) => setTimeout(r, 200));
+    for (let i = 0; i < 50 && !ctx.isIdle() && !stale(); i++) await new Promise((r) => setTimeout(r, 200));
+    if (stale()) return;
     pi.sendMessage(
       {
         customType: "mayfly-stop",
@@ -218,7 +220,11 @@ export default function mayflyExtension(pi: ExtensionAPI) {
       refreshStatus();
     } else if (a.kind === "throttled") {
       schedule(a.retryInMs + 100);
-    } else if (a.kind === "paused" && a.justPaused) {
+    } else if (a.kind === "paused") {
+      // Retry when the quiet rule allows an auto-resume, so held messages are delivered without a new
+      // addressed message. A new addressed message pushes the resume time out; the retry then reschedules.
+      schedule(a.retryInMs + 100);
+      if (!a.justPaused) return;
       refreshStatus();
       const p = profile().budget;
       void channel.post(`⏸ ${channel.name} paused auto-wake: wake budget exhausted (${p.hourlyCap} wakes/hour). It resumes after ${p.quietResumeMinutes} min without addressed messages, or via /mayfly resume.`);
@@ -238,9 +244,16 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     for (const m of incoming) {
       const sm = parseStop(m.text);
       if (sm && stopTargetsMe(sm.target, channel.name, profile().groups)) {
-        stopped = true;
-        void handleStop(m, sm.reason);
-      } else rest.push(m);
+        if (stopAllowed(m.from)) {
+          stopped = true;
+          void handleStop(m, sm.reason);
+          continue;
+        }
+        // Not allowed: say so, and treat it as an ordinary (recorded, non-waking) message. It must not
+        // cancel a pending wake.
+        void channel.post(`⛔ ignoring /stop from "${m.from || "?"}" — not allowed to stop ${channel.name}`, { replyTo: m.seq }).catch(() => {});
+      }
+      rest.push(m);
     }
     const want = inbox.add(rest);
     // Don't start new work right after a stop; what arrived stays buffered for the next wake.
@@ -254,12 +267,26 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     refreshStatus();
   }
 
-  function startWatch(since?: number) {
+  /**
+   * Start the watcher. `ready`, if given, gates delivery: batches are held until it settles. Used on resume,
+   * so the backlog is classified only after history has told us which seqs are ours (for `/re N`).
+   */
+  function startWatch(since?: number, ready?: Promise<unknown>) {
     if (!channel) return;
     const w = new AbortController();
     watcher = w;
+    let onBatch = deliver;
+    if (ready) {
+      let held: MayflyMessage[] | null = [];
+      onBatch = (msgs) => (held ? held.push(...msgs) : deliver(msgs));
+      void ready.finally(() => {
+        const msgs = held!;
+        held = null;
+        if (watcher === w && !w.signal.aborted && msgs.length) deliver(msgs);
+      });
+    }
     channel
-      .watch(deliver, w.signal, {
+      .watch(onBatch, w.signal, {
         // Resume after a restart so messages posted while Pi was closed are not silently skipped.
         since,
         onError: (e, retryInMs) => {
@@ -278,7 +305,8 @@ export default function mayflyExtension(pi: ExtensionAPI) {
 
   function teardown() {
     // Persist the cursor so a later rejoin can resume from where we left off.
-    if (channel && channel.last >= 0) pi.appendEntry("mayfly-cursor", { last: channel.last });
+    // The channel id is stored with it so a cursor is never applied to a different channel.
+    if (channel && channel.last >= 0) pi.appendEntry("mayfly-cursor", { last: channel.last, id: channel.id });
     clearTimer();
     watcher?.abort();
     channel?.close();
@@ -308,7 +336,16 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     return { url: cfg.url, name: cfg.name, profile: mergeProfile(cfg.allowStop ? { allowStop: cfg.allowStop } : undefined) };
   }
 
-  function join(cfg: JoinConfig, ctx: ExtensionContext, persist: boolean, since?: number): string {
+  /** Saved watcher cursor: last delivered seq, and (0.4.1+) the channel it belongs to. */
+  interface Cursor {
+    last: number;
+    id?: string;
+  }
+
+  /** How long a resume waits for history (our own seqs) before delivering the backlog anyway. */
+  const RESUME_HISTORY_WAIT_MS = 5000;
+
+  function join(cfg: JoinConfig, ctx: ExtensionContext, persist: boolean, cursor?: Cursor): string {
     // Explicit joins never silently switch channels.
     if (persist && channel) throw new Error(`Already connected to ${channel.redactedUrl} as "${channel.name}". ${ONE_CHANNEL}`);
     // Validate the new URL/name before leaving the current channel, so a bad join changes nothing.
@@ -317,9 +354,21 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     channel = ch;
     config = normalizeSaved(cfg);
     inbox = new Inbox(config.profile!, { name: ch.name, ownSeqs: ch.ownSeqs });
-    startWatch(since);
+    // Only resume from a cursor saved for this channel (legacy cursors have no id).
+    const since = cursor && (cursor.id === undefined || cursor.id === ch.id) ? cursor.last : undefined;
     // Learn which recent messages are ours so `/re N` to them wakes us after a restart (best effort).
-    ch.history(100).catch(() => {});
+    const hist = ch.history(100).catch(() => {});
+    if (since === undefined) startWatch();
+    else {
+      // Resuming: hold the backlog until history has filled ownSeqs (bounded), so a `/re` to one of our
+      // messages that arrived while Pi was closed is recognized. join itself stays synchronous.
+      let t: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<void>((r) => {
+        t = setTimeout(r, RESUME_HISTORY_WAIT_MS);
+        t.unref?.();
+      });
+      startWatch(since, Promise.race([hist, timeout]).finally(() => clearTimeout(t)));
+    }
     if (persist) {
       // NOTE: cfg.url contains the #key (a password) and is written to the session file so a
       // resumed session can rejoin automatically.
@@ -409,17 +458,18 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     if (isWatching()) return;
     // Auto-rejoin from the most recent join config in this branch.
     let saved: JoinConfig | undefined;
-    let since: number | undefined;
+    let since: Cursor | undefined;
     for (const entry of ctx.sessionManager.getBranch()) {
       if (entry.type !== "custom") continue;
       const data = entry.data as any;
       if (entry.customType === "mayfly-join") {
         if (data?.url && data?.name) saved = normalizeSaved(data as JoinConfig);
+        since = undefined; // a cursor from before this join belongs to an earlier channel
       } else if (entry.customType === "mayfly-leave") {
         saved = undefined; // a later leave cancels an earlier join
         since = undefined;
       } else if (entry.customType === "mayfly-cursor") {
-        if (typeof data?.last === "number") since = data.last;
+        if (typeof data?.last === "number") since = { last: data.last, ...(typeof data.id === "string" ? { id: data.id } : {}) };
       } else if (entry.customType === "mayfly-task" && saved) {
         if (typeof data?.task === "string" && data.task.trim()) saved = { ...saved, task: data.task };
       } else if (entry.customType === "mayfly-wake" && saved) {
@@ -736,14 +786,15 @@ export default function mayflyExtension(pi: ExtensionAPI) {
         "involving its model. Use target \"all\" to stop every agent, or a group tag to stop that group. Only use when " +
         "the user or the situation clearly calls for interrupting that agent.",
       parameters: Type.Object({
-        target: Type.String({ description: 'Chat name of the agent to stop (no spaces), a group tag, or "all".' }),
+        target: Type.String({ description: 'Chat name of the agent to stop (may contain spaces), a group tag, or "all".' }),
         reason: Type.Optional(Type.String({ description: "Short reason shown to the stopped agent." })),
       }),
       async execute(_id, params) {
         if (!channel) return notJoined;
         const target = params.target.trim().replace(/^@/, "");
-        if (!target || /\s/.test(target)) return text('target must be a single chat name without spaces, a group, or "all".', true);
-        const res = await channel.post(`/stop ${target}${params.reason ? ` ${params.reason}` : ""}`);
+        if (!target || target.includes('"')) return text('target must be a chat name without double quotes, a group, or "all".', true);
+        // A name with spaces is sent quoted: /stop "Pi Bot" reason.
+        const res = await channel.post(`/stop ${/\s/.test(target) ? `"${target}"` : target}${params.reason ? ` ${params.reason}` : ""}`);
         const msg =
           res.posted === true
             ? `Stop request sent to ${target} as #${res.id}. It will acknowledge with a ⏹ message.`

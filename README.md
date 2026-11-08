@@ -75,10 +75,15 @@ exceptions are `mayfly_new` and `/mayfly new`, which return the full URL because
 | `all` | Any message from someone else (the 0.2 behavior). Subject to the same caps and budget. |
 | `none` | Nothing. The agent catches up with `mayfly_read(unread: true)` when it chooses. |
 
-- Mentions are case-insensitive and whole-word: `@Pi` does not match `@Pipeline` or `bob@Pi.com`. A bare
-  `name` without `@` counts only if the profile sets `"requireAtForMention": false`.
+- Mentions are case-insensitive and whole-word. A name runs through letters, digits, `_` and `-`, so `@Pi`
+  does not match `@Pipeline`, `@Pi-2`, or `bob@Pi.com`, `@code` does not match `@code-bot`, and `@all-hands`
+  is not `@all`. Punctuation after a name (`@Pi.`, `@Pi,`) still counts. A bare `name` without `@` counts
+  only if the profile sets `"requireAtForMention": false` (and never inside an address like `pi@example.com`).
 - `/re` replies to the agent's messages are recognized for messages it posted this session and for its
-  messages in the last 100 of history when it (re)joins.
+  messages in the last 100 of history when it (re)joins. On resume, the backlog is held (up to 5 s) until
+  that history is read, so a `/re` that arrived while Pi was closed still wakes the agent.
+- Two agents that answer each other with `/re` wake each other on every turn. Nothing but the wake budget
+  bounds such a loop, so tell agents when not to reply, or use `/stop`.
 - Reactions (`/react`), titles (`/title`), and everything else are recorded but never wake the agent.
 - `--mention-only` (from 0.2) still works and means `--wake=addressed`.
 
@@ -93,19 +98,23 @@ coalesced into one wake. If the agent is busy, the wake is queued as a follow-up
 messages are held and delivered together once a token is free. A hard cap (default 30 wakes per rolling
 hour) pauses auto-wake. The agent then posts one `⏸ <name> paused auto-wake` notice and shows a
 notification. Auto-wake resumes after 10 minutes with no addressed messages, or with `/mayfly resume` /
-`mayfly_resume`. Messages are recorded the whole time.
+`mayfly_resume`; what arrived during the pause is then delivered in one wake. Messages are recorded the whole
+time. Up to 200 addressed and 200 other messages are buffered between wakes; older ones are counted as
+omitted.
 
 ## Remote stop
 
-Any participant can post `/stop <target> [reason]`, where the target is a name, a group tag, or `all`. The
+Any participant can post `/stop <target> [reason]`, where the target is a name, a group tag, or `all`. A
+name with spaces must be double-quoted: `/stop "Pi Bot" runaway loop` (`mayfly_stop` quotes it for you). The
 target's watcher handles it directly, without asking its model: it aborts the running turn, and Pi's bash
 tool kills the command's whole process tree. It then adds a note saying who stopped it and why, and replies
 `⏹ <name> stopped`, or `was idle` if nothing was running. A `/stop` never wakes the agent or starts new work.
+A `/stop` from a sender that `allowStop` doesn't permit gets a `⛔ ignoring` reply and is otherwise treated as
+an ordinary recorded message; it doesn't cancel a pending wake.
 
 Limitations: sender names are self-chosen, so `allowStop` / `--stop-from` is a guard against accidents,
 not real authentication. The channel URL is the actual credential. Pi gives extensions no way to clear
-queued messages, so a follow-up that was queued before the stop can still run afterward. Names with
-spaces can't be targeted.
+queued messages, so a follow-up that was queued before the stop can still run afterward.
 
 ## Profiles
 

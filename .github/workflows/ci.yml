@@ -72,7 +72,11 @@ jobs:
         with:
           node-version: 24
 
-      - name: Integration tests (core against a real server)
+      # The extension wiring tests load index.ts, which needs Pi and typebox.
+      - name: Install dev deps + Pi
+        run: npm install --no-audit --no-fund
+
+      - name: Integration tests (core and extension wiring against a real server)
         env:
           MAYFLY_SERVER_BIN: ${{ runner.temp }}/mayfly
           MAYFLY_REQUIRE_SERVER: "1"
