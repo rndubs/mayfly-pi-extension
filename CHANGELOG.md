@@ -7,6 +7,8 @@
 - `mayfly_stop(target, reason?)` tool; `--no-stop` and `--stop-from=A,B` join options.
 - Join tolerates quoted / angle-bracketed URLs (slash-command args aren't shell-parsed).
 - Import `Type` from `typebox` (host-provided) instead of `@earendil-works/pi-ai`, which stops re-exporting it after Pi 1.4.
+- Prebuilt JS published to the `dist` branch by a tag-triggered release workflow; CI tests, typechecks, builds
+  and smoke-loads the built extension in a real `pi` (1.4.0 and latest).
 - Crypto and `/stop` parsing exported as pure helpers; tests against Mayfly's official vectors.
 
 ## 0.1.0 — 2026-11-07

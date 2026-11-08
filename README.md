@@ -6,18 +6,21 @@ queued as a follow-up while it's busy. The model never has to write a watcher or
 
 ## Install
 
-Private package, not published to npm or the Pi gallery. Install from a local checkout:
+Install the prebuilt JS that the release workflow publishes to the `dist` branch:
 
 ```sh
-git clone git@github.com:rndubs/mayfly-pi-extension.git ~/code/mayfly-pi-extension
-pi install ~/code/mayfly-pi-extension
+pi install git:github.com/rndubs/mayfly-pi-extension@dist          # tracks the latest release
+pi install git:github.com/rndubs/mayfly-pi-extension@dist-v0.2.0   # pinned to one release
 ```
 
-Pi loads the package in place, so `git pull` plus `/reload` updates it. If you have an older loose copy at
-`~/.pi/agent/extensions/mayfly/`, delete it so the extension isn't loaded twice.
+`pi update` moves the `@dist` install forward to new releases. The package isn't published to npm or listed
+in the Pi gallery. If you have an older loose copy at `~/.pi/agent/extensions/mayfly/`, delete it so the
+extension isn't loaded twice.
 
 There are no runtime dependencies (only `node:crypto` and `fetch`). Pi itself provides
-`@earendil-works/pi-coding-agent` and `typebox`.
+`@earendil-works/pi-coding-agent` and `typebox`. To hack on it, install from a source checkout
+instead: `pi install ~/code/mayfly-pi-extension`. Pi loads the TypeScript directly, and `/reload`
+picks up your edits.
 
 ## Use
 
@@ -69,9 +72,21 @@ can't be targeted.
 ## Development
 
 ```sh
+npm install         # dev deps; also pulls Pi's packages (peer deps) for typechecking and the smoke test
 npm test            # node --test: crypto vs Mayfly's official vectors, URL parsing, /stop parser
-npm run typecheck   # needs `npm i` (typescript, @types/node) and Pi's packages resolvable
+npm run typecheck
+npm run build       # tsc -> dist/
+npm run smoke       # load dist/index.js in a real `pi` (RPC mode, empty config) and run /mayfly status
 ```
+
+**CI** (`.github/workflows/ci.yml`) runs all of the above on every push and pull request, against Pi 1.4.0
+and the latest Pi.
+
+**Releasing:** bump `version` in package.json, add a CHANGELOG section, commit, then
+`git tag vX.Y.Z && git push origin vX.Y.Z`. The release workflow checks that the tag matches the version,
+reruns the checks, and pushes the built tree (JS, `.d.ts`, docs, and a `package.json` without dev
+dependencies or scripts) to the `dist` branch with the tag `dist-vX.Y.Z`. It then creates a GitHub
+Release with the `.tgz` attached.
 
 ## Credits
 

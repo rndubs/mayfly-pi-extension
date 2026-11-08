@@ -1,0 +1,83 @@
+name: Release
+
+# Push a tag like v0.2.0 (matching package.json "version") to publish:
+#   - built JS to the `dist` branch, also tagged dist-v0.2.0  → `pi install git:github.com/<owner>/<repo>@dist`
+#   - a GitHub Release with the packed .tgz attached
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Check tag matches package.json version
+        run: |
+          version="$(node -p 'require("./package.json").version')"
+          if [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} does not match package.json version ${version}"; exit 1
+          fi
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+
+      - name: Install, test, typecheck, build
+        run: |
+          npm install --no-audit --no-fund
+          npm test
+          npm run typecheck
+          npm run build
+          node scripts/assemble-dist.mjs _dist
+
+      - name: Smoke test (load built extension in real pi)
+        run: scripts/smoke.sh _dist/index.js "$(pwd)/node_modules/.bin/pi"
+
+      - name: Publish to dist branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin dist >/dev/null; then
+            git fetch origin dist
+            git worktree add _rel origin/dist
+            git -C _rel switch -C dist
+          else
+            git worktree add --orphan -b dist _rel
+          fi
+          find _rel -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+          cp -R _dist/. _rel/
+          cd _rel
+          git add -A
+          git commit -m "Release v${VERSION} (built from ${GITHUB_SHA::7})"
+          git tag "dist-v${VERSION}"
+          git push origin dist "dist-v${VERSION}"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd _dist && npm pack --pack-destination ..)
+          # Release notes = this version's CHANGELOG section.
+          awk -v v="${VERSION}" '$0 ~ "^## "v" " {p=1; next} /^## / {p=0} p' CHANGELOG.md > notes.md
+          cat >> notes.md <<NOTES
+
+          ### Install
+          \`\`\`sh
+          pi install git:github.com/${GITHUB_REPOSITORY}@dist-v${VERSION}   # pinned
+          pi install git:github.com/${GITHUB_REPOSITORY}@dist               # tracks latest release
+          \`\`\`
+          NOTES
+          gh release create "${GITHUB_REF_NAME}" "mayfly-pi-extension-${VERSION}.tgz" \
+            --title "v${VERSION}" --notes-file notes.md

@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: test · typecheck · build · smoke (pi ${{ matrix.pi }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The version we run locally, plus whatever is newest (catches upcoming breakage).
+        pi: ["1.4.0", "latest"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Install dev deps + Pi ${{ matrix.pi }}
+        run: |
+          npm install --no-audit --no-fund
+          npm install --no-save --no-audit --no-fund "@earendil-works/pi-coding-agent@${{ matrix.pi }}"
+          npx pi --version || true
+
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run build
+
+      - name: Assemble release tree
+        run: node scripts/assemble-dist.mjs _dist
+
+      - name: Smoke test (load built extension in real pi)
+        run: scripts/smoke.sh _dist/index.js "$(pwd)/node_modules/.bin/pi"

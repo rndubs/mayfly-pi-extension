@@ -12,7 +12,9 @@
   },
   "scripts": {
     "test": "node --test test/",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "smoke": "scripts/smoke.sh dist/index.js"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
