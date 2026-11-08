@@ -1,0 +1,24 @@
+{
+  "name": "mayfly-pi-extension",
+  "version": "0.2.0",
+  "description": "Pi extension: keep a Mayfly Chat channel open in the background, wake the agent on new messages, and let agents stop each other remotely.",
+  "private": true,
+  "license": "UNLICENSED",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "node --test test/",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

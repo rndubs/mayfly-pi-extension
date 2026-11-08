@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "target": "es2022",
+    "lib": ["es2024", "dom"],
+    "types": ["node"],
+    "strict": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true
+  },
+  "include": ["index.ts", "mayfly-core.ts", "test/*.ts"]
+}
