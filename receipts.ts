@@ -436,21 +436,32 @@ export class ReceiptTracker {
     return out;
   }
 
-  /** Wait until `seq` is acknowledged at `level`, the timeout passes, or `signal` aborts. */
-  wait(seq: number, level: ReceiptLevel, timeoutMs: number, signal?: AbortSignal): Promise<WaitResult> {
+  /**
+   * Wait until `seq` is acknowledged at `level`, the timeout passes, or `signal` aborts. A busy notice is posted
+   * right after the 📬, so once a "received" wait is satisfied it lingers up to `busyGraceMs` for a busy notice (or
+   * 👀) from each recipient that hasn't seen it yet, so the result can say who is busy.
+   */
+  wait(seq: number, level: ReceiptLevel, timeoutMs: number, signal?: AbortSignal, busyGraceMs = 1500): Promise<WaitResult> {
     const rec = this.ensure(seq);
     return new Promise((resolve) => {
       let t: ReturnType<typeof setTimeout> | undefined;
+      let grace: ReturnType<typeof setTimeout> | undefined;
+      const settledForBusy = (r: OwnRecord) =>
+        (r.targets?.names ?? []).every((n) => has(r.seen, n) || r.busy.some((b) => b.name.toLowerCase() === n.toLowerCase()));
       const finish = (satisfied: boolean, aborted = false, cancelled?: string) => {
         this.listeners.delete(check);
         this.cancellers.delete(cancel);
         if (t) clearTimeout(t);
+        if (grace) clearTimeout(grace);
         signal?.removeEventListener("abort", onAbort);
         resolve({ satisfied, aborted, ...(cancelled ? { cancelled } : {}), record: this.records.get(seq) ?? rec });
       };
       const cancel = (why: string) => finish(false, false, why);
       const check = () => {
-        if (ReceiptTracker.satisfied(this.records.get(seq) ?? rec, level)) finish(true);
+        const r = this.records.get(seq) ?? rec;
+        if (!ReceiptTracker.satisfied(r, level)) return;
+        if (level === "seen" || busyGraceMs <= 0 || settledForBusy(r)) return finish(true);
+        grace ??= setTimeout(() => finish(true), busyGraceMs);
       };
       const onAbort = () => finish(false, true);
       if (signal?.aborted) return onAbort();

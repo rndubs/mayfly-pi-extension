@@ -7,6 +7,16 @@
   was undefined (status showed "after undefineds"), and the per-sender interrupt limit was undefined. Saved
   profiles are now merged over the current defaults on resume, so new settings get their defaults and saved
   values still win. Found by Pi while upgrading a live session.
+- **`waitFor: "received"` reports busy recipients.** A busy notice is posted right after the 📬, so the wait used
+  to return before it arrived. Once satisfied, it now lingers up to 1.5 s for a busy notice (or 👀) from each
+  recipient that hasn't seen the message, so the result says e.g. "Bob said it is busy (bash, 56s)".
+- **The footer chat link looks clickable.** `mayfly: <name>` in the footer status is now underlined and followed
+  by ↗, and the join notification and `/mayfly status` say "Cmd-click 💬 mayfly in the footer, or run /mayfly
+  open". The link was there since 0.4 but read as plain text, so it was easy to miss.
+- **Wakes name your groups.** The wake header now lists the agent's groups (`your groups: @reviewers`), so an
+  agent woken by `@reviewers` knows it's a member instead of guessing.
+- **e2e script updated for receipts.** The scripted poster retries on conflicts caused by agents' 📬/👀, intros and
+  receipts are excluded from the "no replies" check, and new checks cover 📬/👀 on `@A` and none on `@all`.
 
 ## 0.5.0 — 2026-11-07
 

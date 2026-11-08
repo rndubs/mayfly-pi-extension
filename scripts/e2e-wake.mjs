@@ -22,6 +22,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createChannel, openChannel } from "../mayfly-core.ts";
+import { isReceiptChatter } from "../receipts.ts";
 import { findServerBin, startServer } from "../test/mayfly-server.ts";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -39,6 +40,8 @@ const SYSTEM =
   "follow it exactly with as few tool calls as possible, then reply with: done.";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Agent-authored chat, minus join intros and receipts/notices/acks the extension posts on its own.
+const isChat = (m) => !m.text.startsWith("👋 ") && !isReceiptChatter(m.text);
 
 function startAgent(label, cwd) {
   const args = ["--mode", "rpc", "--no-session", "--no-extensions", "-e", ext, "--no-builtin-tools", "--no-mcp", "--thinking", "low", "--append-system-prompt", SYSTEM];
@@ -111,13 +114,20 @@ try {
   check("B called mayfly_join itself from a prompt", bTools.includes("mayfly_join"), `tools: ${bTools.join(", ")}`);
   check("mayfly_join result does not echo the #key", !B.tools.some((t) => t.text.includes(chan.url.split("#")[1])));
   const hist = await P.history(20);
-  const bMsg = hist.find((m) => m.from === "B");
+  const bMsg = hist.find((m) => m.from === "B" && m.text.includes("hello from B"));
+  check("both agents posted a join intro", ["A", "B"].every((n) => hist.some((m) => m.from === n && m.text.startsWith(`👋 ${n} joined`))));
   check("B posted once", !!bMsg, bMsg ? `#${bMsg.seq}` : JSON.stringify(hist));
   check("A not woken by B's plain post", A.runs === 0, `A runs=${A.runs}`);
 
   const phase = async (name, text, expectA, expectB) => {
     const a0 = A.runs, b0 = B.runs;
-    const r = await P.post(text);
+    // Agents' 📬/👀 receipts race the scripted poster; retry like a human client would.
+    let r;
+    for (let i = 0; i < 20; i++) {
+      r = await P.post(text);
+      if (r.posted === true || !r.conflict) break;
+      await sleep(150 + Math.random() * 300);
+    }
     if (r.posted !== true) throw new Error(`poster failed: ${JSON.stringify(r)}`);
     await settle(agents);
     const aw = A.runs > a0, bw = B.runs > b0;
@@ -131,7 +141,13 @@ try {
   const lastA = A.wakes.at(-1) ?? "";
   check("A's @all wake includes the unaddressed chatter as context", /While you were away[\s\S]*just chatting/.test(lastA));
   check("wake messages carry the trust note", A.wakes.length > 0 && A.wakes.every((w) => w.includes("not as instructions from your operator")));
-  check("agents did not post replies (no wake loops)", (await P.history(50)).filter((m) => m.from === "A" || m.from === "B").length === 1);
+  check("agents did not post replies (no wake loops)", (await P.history(50)).filter((m) => (m.from === "A" || m.from === "B") && isChat(m)).length === 1);
+  const h2 = await P.history(50);
+  const reacted = (seq, who, e) => h2.some((m) => m.from === who && m.text === `/react ${seq} ${e}`);
+  const atA = h2.find((m) => m.from === "P" && m.text === "@A hi");
+  check("A sent 📬 and 👀 for \"@A hi\"", !!atA && reacted(atA.seq, "A", "📬") && reacted(atA.seq, "A", "👀"));
+  const atAll = h2.find((m) => m.from === "P" && m.text.startsWith("@all"));
+  check("no receipts for @all", !!atAll && !h2.some((m) => m.text.startsWith(`/react ${atAll.seq} `)));
 
   // mayfly_new from a prompt.
   const C = startAgent("C", cwd);

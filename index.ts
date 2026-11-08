@@ -44,7 +44,7 @@ import {
   resolveTargets,
   SEEN,
 } from "./receipts.js";
-import { parseIntro, browserCommand, introMessage, osc8, splitTaskArg, statusLabel, taskUpdateMessage } from "./presence.js";
+import { parseIntro, browserCommand, introMessage, openHint, splitTaskArg, statusLine, taskUpdateMessage } from "./presence.js";
 import {
   type AllowStop,
   loadProfileFile,
@@ -427,7 +427,7 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     if (!ctx?.hasUI) return;
     try {
       if (!channel || !inbox || !config) return ctx.ui.setStatus(STATUS_KEY, undefined);
-      const label = statusLabel({
+      const line = statusLine(config.url, {
         name: channel.name,
         wake: profile().wake,
         unseen: inbox.unseenCount,
@@ -435,7 +435,7 @@ export default function mayflyExtension(pi: ExtensionAPI) {
         paused: inbox.budget.isPaused,
         reconnecting,
       });
-      ctx.ui.setStatus(STATUS_KEY, "💬 " + osc8(config.url, label));
+      ctx.ui.setStatus(STATUS_KEY, line);
     } catch {
       /* status is cosmetic; never let it break delivery */
     }
@@ -486,7 +486,9 @@ export default function mayflyExtension(pi: ExtensionAPI) {
   }
 
   function header() {
-    return `Mayfly chat ${channel!.redactedUrl} — you are already connected as "${channel!.name}" (wake policy: ${profile().wake}); no need to join.`;
+    return `Mayfly chat ${channel!.redactedUrl} — you are already connected as "${channel!.name}" (wake policy: ${profile().wake}${
+      profile().groups.length ? `; your groups: ${profile().groups.map((g) => `@${g}`).join(", ")}` : ""
+    }); no need to join.`;
   }
 
   function attemptWake() {
@@ -714,7 +716,7 @@ export default function mayflyExtension(pi: ExtensionAPI) {
       void bgPost(introMessage(ch.name, config.profile!, config.task));
     }
     const summary = `Watching ${ch.redactedUrl} as "${ch.name}" (wake: ${config.profile!.wake}${config.profile!.groups.length ? `, groups: ${config.profile!.groups.join(", ")}` : ""}).`;
-    if (ctx.hasUI) ctx.ui.notify(`Mayfly: ${summary}`, "info");
+    if (ctx.hasUI) ctx.ui.notify(`Mayfly: ${summary}\n${openHint()}`, "info");
     refreshStatus();
     return summary;
   }
@@ -744,6 +746,7 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     return [
       `Watching ${channel.redactedUrl} as "${channel.name}"${config?.profilePath ? ` (profile ${config.profilePath})` : ""}`,
       `task: ${config?.task ?? "(not stated)"}`,
+      `open: ${openHint()}`,
       `wake: ${p.wake}; groups: ${p.groups.length ? p.groups.map((g) => "@" + g).join(" ") : "(none)"}; bare-name mentions: ${p.requireAtForMention ? "off" : "on"}`,
       `budget: ${budget}`,
       `unseen: ${inbox.unseenCount} (${inbox.pending.length} addressed); cursor #${channel.last}; remote stop/interrupt: ${allow}`,

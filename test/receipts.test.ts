@@ -176,6 +176,32 @@ test("ReceiptTracker.wait: resolves on the receipt, times out, or aborts", async
   assert.deepEqual([(await w3).satisfied, (await w3).aborted], [false, true]);
 });
 
+test("ReceiptTracker.wait received: lingers briefly for a busy notice after the 📬, ends early on busy or 👀", async () => {
+  const t = new ReceiptTracker();
+  t.noteOwn(1, "@B hi", { names: ["B"], broadcast: false });
+  const w = t.wait(1, "received", 5000, undefined, 2000);
+  let done = false;
+  void w.then(() => (done = true));
+  t.noteReaction("B", 1, "📬");
+  await new Promise((r) => setTimeout(r, 30));
+  assert.equal(done, false, "still in the busy grace");
+  t.noteBusy("B", 1, "bash", "56s");
+  const r = await w;
+  assert.equal(r.satisfied, true);
+  assert.equal(r.record.busy[0].tool, "bash");
+  // No busy notice: the grace runs out and the wait is still satisfied.
+  t.noteOwn(2, "@B again", { names: ["B"], broadcast: false });
+  const w2 = t.wait(2, "received", 5000, undefined, 40);
+  t.noteReaction("B", 2, "📬");
+  assert.equal((await w2).satisfied, true);
+  // Already seen: no grace at all.
+  t.noteOwn(3, "@B more", { names: ["B"], broadcast: false });
+  t.noteReaction("B", 3, "👀");
+  const start = Date.now();
+  assert.equal((await t.wait(3, "received", 5000, undefined, 2000)).satisfied, true);
+  assert.ok(Date.now() - start < 500);
+});
+
 test("describeReceipts", () => {
   let now = 0;
   const t = new ReceiptTracker(200, () => now);
