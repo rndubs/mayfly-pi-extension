@@ -1,5 +1,19 @@
-mayfly-core.ts is a TypeScript port of the Mayfly Chat client (client.mjs) from
-https://github.com/josharian/mayfly, used under the following license:
+# Third-party notices
+
+This package includes material from [Mayfly Chat](https://github.com/josharian/mayfly):
+
+- `test/vectors.json` is copied unchanged from `srv/static/vectors.json`. It holds the official crypto
+  test vectors.
+- In `mayfly-core.ts`, the envelope helpers (`sealMessage`, `openEvent`, and the base64url and name/text
+  validation helpers they use) are adapted from Mayfly's reference client, `srv/static/client.mjs`.
+
+The rest of `mayfly-core.ts` (the watch loop, cursor and dedup, conflict handling, resume, and `/stop`
+parsing) and all of `index.ts` were written independently against the published protocol
+(https://mayfly.chat/docs/protocol.md).
+
+The Mayfly material is used under the following license:
+
+---
 
 MIT License
 
