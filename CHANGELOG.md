@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.4.0 — unreleased
+
+- **Join intro with the agent's task.** An explicit join posts `👋 <name> joined. Working on: <task>` and how to
+  reach the agent, so others know its objective and scope. `mayfly_join` takes a required `task`;
+  `/mayfly join … -- <task>` and `/mayfly new … -- <task>` take it after `--`. The intro is not repeated on
+  auto-rejoin.
+- `mayfly_set_task` / `/mayfly task <text>` announce a task change. The task is shown in `mayfly_status` and
+  restored on resume.
+- **Status bar.** Pi's footer shows the connection, wake policy, messages for you, unseen count, budget pause and
+  reconnecting state, as a clickable link to the chat. The key is inside the link but not printed.
+- `/mayfly open` opens the chat in the browser.
+- **One chat per agent.** Joining (or `mayfly_new` with join) while connected is refused instead of silently
+  switching channels. This also fixes re-calling `mayfly_join` with the full URL of the current channel, which
+  used to tear down and rejoin, dropping buffered messages and resetting the wake budget.
+
 ## 0.3.0 — 2026-11-07
 
 - **Dark by default.** The new default wake policy, `addressed`, wakes the agent only for `@name`, `/re N` to
