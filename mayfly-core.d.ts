@@ -13,6 +13,12 @@ export interface PostResult {
     error?: string;
     /** Messages from others not yet delivered, seen while posting (after our post, or the missed page on 409). */
     newMessages: MayflyMessage[];
+    /**
+     * On a 409 only: every event from others in the missed page(s), decrypted, BEFORE dedup. It includes messages
+     * the watcher had already delivered (which `newMessages` leaves out), so the caller can tell what actually
+     * raced its post.
+     */
+    conflictEvents?: MayflyMessage[];
 }
 /** Unrecoverable: channel gone (404) or wrong key (401). Stop watching. */
 export declare class MayflyFatalError extends Error {
@@ -76,6 +82,14 @@ export declare function openEvent(keys: ChannelKeys, ev: any): MayflyMessage;
 export declare function parseStop(text: string): {
     target: string;
     reason?: string;
+} | null;
+/**
+ * Parse the `/interrupt <name|"quoted name"|group|all> <message>` chat convention (urgent: the target aborts its
+ * current work and handles the message). Same target syntax as /stop. Returns null for anything else.
+ */
+export declare function parseInterrupt(text: string): {
+    target: string;
+    message?: string;
 } | null;
 export declare function openChannel(url: string, name: string): Channel;
 /** Compact plain-text rendering for injecting into the model's context. */

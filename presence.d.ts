@@ -3,6 +3,14 @@ import type { Profile } from "./profile.js";
 export declare function reachability(name: string, p: Pick<Profile, "wake" | "groups">): string;
 /** The message posted on an explicit join: who joined, what they're working on, and how to reach them. */
 export declare function introMessage(name: string, p: Pick<Profile, "wake" | "groups">, task?: string): string;
+/**
+ * Parse another agent's join intro (see introMessage) to learn its name and the groups it answers to.
+ * `👋 B joined. …\n(reach me with @B or @reviewers or @ops, or reply …)` → { name: "B", groups: ["reviewers", "ops"] }.
+ */
+export declare function parseIntro(text: string): {
+    name: string;
+    groups: string[];
+} | null;
 /** Posted when the agent's task changes mid-session. */
 export declare function taskUpdateMessage(name: string, task: string): string;
 /**

@@ -98,6 +98,14 @@ export function parseStop(text) {
     const m = /^\/stop\s+(?:@?"([^"]+)"|@?(\S+))(?:\s+([\s\S]*\S))?\s*$/i.exec(text);
     return m ? { target: m[1] ?? m[2], reason: m[3] } : null;
 }
+/**
+ * Parse the `/interrupt <name|"quoted name"|group|all> <message>` chat convention (urgent: the target aborts its
+ * current work and handles the message). Same target syntax as /stop. Returns null for anything else.
+ */
+export function parseInterrupt(text) {
+    const m = /^\/interrupt\s+(?:@?"([^"]+)"|@?(\S+))(?:\s+([\s\S]*\S))?\s*$/i.exec(text);
+    return m ? { target: m[1] ?? m[2], message: m[3] } : null;
+}
 export function openChannel(url, name) {
     if (!validName(name))
         throw new Error("name must be nonempty, trimmed, no control characters");
@@ -225,7 +233,8 @@ export function openChannel(url, name) {
                     events = events.concat(rest.events);
                     last = rest.last;
                 }
-                return { posted: false, conflict: true, newMessages: ingest(events, last) };
+                const conflictEvents = events.filter((ev) => typeof ev?.seq === "number").map(open).filter((m) => m.from !== channel.name);
+                return { posted: false, conflict: true, newMessages: ingest(events, last), conflictEvents };
             }
             // Our own post is seq=json.id; mark it known. Events are replies after it.
             if (typeof json.id === "number" && json.id > head)

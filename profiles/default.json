@@ -3,7 +3,9 @@
   "groups": [],
   "wake": "addressed",
   "context": { "recentK": 10, "maxBytes": 16384 },
-  "budget": { "burst": 6, "refillPerMinute": 1, "hourlyCap": 30, "quietResumeMinutes": 10 },
+  "budget": { "burst": 6, "refillPerMinute": 1, "hourlyCap": 30, "quietResumeMinutes": 10, "interruptsPerHour": 6 },
   "allowStop": "anyone",
-  "requireAtForMention": true
+  "requireAtForMention": true,
+  "receipts": true,
+  "busyNoticeAfterSec": 30
 }

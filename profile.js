@@ -9,9 +9,11 @@ export const DEFAULT_PROFILE = Object.freeze({
     groups: [],
     wake: "addressed",
     context: { recentK: 10, maxBytes: 16 * 1024 },
-    budget: { burst: 6, refillPerMinute: 1, hourlyCap: 30, quietResumeMinutes: 10 },
+    budget: { burst: 6, refillPerMinute: 1, hourlyCap: 30, quietResumeMinutes: 10, interruptsPerHour: 6 },
     allowStop: "anyone",
     requireAtForMention: true,
+    receipts: true,
+    busyNoticeAfterSec: 30,
 });
 export const WAKE_POLICIES = ["addressed", "all", "none"];
 const GROUP_RE = /^[\p{L}\p{N}_-]+$/u;
@@ -22,7 +24,7 @@ export function validateProfile(raw, source = "profile") {
     if (!isObj(raw))
         throw new Error(`${source}: expected a JSON object`);
     const out = {};
-    const known = new Set(["name", "groups", "wake", "context", "budget", "allowStop", "requireAtForMention", "description", "$schema"]);
+    const known = new Set(["name", "groups", "wake", "context", "budget", "allowStop", "requireAtForMention", "receipts", "busyNoticeAfterSec", "description", "$schema"]);
     for (const k of Object.keys(raw))
         if (!known.has(k))
             errs.push(`unknown key "${k}"`);
@@ -71,6 +73,7 @@ export function validateProfile(raw, source = "profile") {
         refillPerMinute: { min: 0, int: false },
         hourlyCap: { min: 1, int: true },
         quietResumeMinutes: { min: 0, int: false },
+        interruptsPerHour: { min: 0, int: true },
     });
     if (raw.allowStop !== undefined) {
         const a = raw.allowStop;
@@ -86,6 +89,19 @@ export function validateProfile(raw, source = "profile") {
             errs.push("requireAtForMention: must be true or false");
         else
             out.requireAtForMention = raw.requireAtForMention;
+    }
+    if (raw.receipts !== undefined) {
+        if (typeof raw.receipts !== "boolean")
+            errs.push("receipts: must be true or false");
+        else
+            out.receipts = raw.receipts;
+    }
+    if (raw.busyNoticeAfterSec !== undefined) {
+        const v = raw.busyNoticeAfterSec;
+        if (v === false || (typeof v === "number" && Number.isFinite(v) && v >= 0))
+            out.busyNoticeAfterSec = v;
+        else
+            errs.push("busyNoticeAfterSec: must be a number of seconds >= 0, or false to disable");
     }
     if (errs.length)
         throw new Error(`${source}: ${errs.join("; ")}`);
@@ -112,6 +128,10 @@ export function mergeProfile(...layers) {
             p.allowStop = Array.isArray(l.allowStop) ? [...l.allowStop] : l.allowStop;
         if (l.requireAtForMention !== undefined)
             p.requireAtForMention = l.requireAtForMention;
+        if (l.receipts !== undefined)
+            p.receipts = l.receipts;
+        if (l.busyNoticeAfterSec !== undefined)
+            p.busyNoticeAfterSec = l.busyNoticeAfterSec;
         if (l.context)
             Object.assign(p.context, stripUndefined(l.context));
         if (l.budget)

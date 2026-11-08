@@ -22,11 +22,24 @@ export interface Profile {
         hourlyCap: number;
         /** After a pause, resume once this many minutes pass with no addressed messages. */
         quietResumeMinutes: number;
+        /**
+         * Urgent /interrupts accepted per sender per rolling hour (default 6). Within it an interrupt aborts the running
+         * work and wakes at once, bypassing the throttle and a pause. Above it, the interrupt is handled as an ordinary
+         * addressed message (no abort; normal budget and wake policy).
+         */
+        interruptsPerHour: number;
     };
-    /** Who may `/stop` this agent: anyone in the channel, nobody, or these sender names. */
+    /** Who may `/stop` or `/interrupt` this agent: anyone in the channel, nobody, or these sender names. */
     allowStop: AllowStop;
     /** true (default): only `@name` counts as a mention. false: the bare word `name` does too. */
     requireAtForMention: boolean;
+    /** true (default): react 📬 when an addressed message is received and 👀 when it reaches the model. */
+    receipts: boolean;
+    /**
+     * Post a one-time "⏳ busy" notice when an addressed message arrives while one tool call has been running
+     * longer than this many seconds (default 30). false disables the notice.
+     */
+    busyNoticeAfterSec: number | false;
 }
 export declare const DEFAULT_PROFILE: Profile;
 /** Deep-partial profile, as found in a file or built from flags. */
@@ -38,6 +51,8 @@ export interface ProfileInput {
     budget?: Partial<Profile["budget"]>;
     allowStop?: AllowStop;
     requireAtForMention?: boolean;
+    receipts?: boolean;
+    busyNoticeAfterSec?: number | false;
 }
 export declare const WAKE_POLICIES: readonly WakePolicy[];
 /** Validate an untrusted value (parsed JSON or tool args) as a partial profile. Throws with every problem listed. */

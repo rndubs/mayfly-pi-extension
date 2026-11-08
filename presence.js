@@ -14,6 +14,19 @@ export function introMessage(name, p, task) {
     const t = task?.trim();
     return `👋 ${name} joined.${t ? ` Working on: ${t.replace(/\s+/g, " ")}` : ""}\n(${reachability(name, p)}.)`;
 }
+/**
+ * Parse another agent's join intro (see introMessage) to learn its name and the groups it answers to.
+ * `👋 B joined. …\n(reach me with @B or @reviewers or @ops, or reply …)` → { name: "B", groups: ["reviewers", "ops"] }.
+ */
+export function parseIntro(text) {
+    const head = /^👋 (.+?) joined\./u.exec(text);
+    if (!head)
+        return null;
+    const name = head[1];
+    const reach = /\(reach me with ((?:@[\p{L}\p{N}_-]+(?: or )?)+)/u.exec(text);
+    const tags = reach ? [...reach[1].matchAll(/@([\p{L}\p{N}_-]+)/gu)].map((m) => m[1]) : [];
+    return { name, groups: tags.filter((t) => t.toLowerCase() !== name.toLowerCase()) };
+}
 /** Posted when the agent's task changes mid-session. */
 export function taskUpdateMessage(name, task) {
     return `📝 ${name} is now working on: ${task.trim().replace(/\s+/g, " ")}`;
