@@ -9,6 +9,7 @@
 // and 409 handling. policy.ts owns the pure wake/context/budget logic, profile.ts the settings. This
 // file owns Pi wiring: tools, commands, the session lifecycle, timers, and delivery.
 
+import { spawn } from "node:child_process";
 import { Type } from "typebox";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -21,6 +22,7 @@ import {
   parseStop,
 } from "./mayfly-core.js";
 import { Inbox, stopTargetsMe } from "./policy.js";
+import { browserCommand, introMessage, osc8, splitTaskArg, statusLabel, taskUpdateMessage } from "./presence.js";
 import {
   type AllowStop,
   loadProfileFile,
@@ -40,6 +42,8 @@ interface JoinConfig {
   profile?: Profile;
   /** Where the profile came from, for status only. */
   profilePath?: string;
+  /** What this agent is working on; announced on join and shown in status. */
+  task?: string;
   /** Legacy (v0.2) fields. */
   mentionOnly?: boolean;
   allowStop?: AllowStop;
@@ -52,7 +56,13 @@ export interface JoinRequest {
   profile?: string;
   /** Explicit overrides (highest precedence). */
   overrides?: ProfileInput;
+  /** One line on what this agent is working on (posted in the join intro). */
+  task?: string;
 }
+
+const ONE_CHANNEL =
+  "One chat per agent: leave first (mayfly_leave or /mayfly leave). To work in another channel at the same time, " +
+  "start a subagent and have it join that channel.";
 
 const DEFAULT_ORIGIN = "https://mayfly.chat";
 /** Coalesce batches arriving back-to-back (e.g. several pages on resume) into one wake. */
@@ -76,6 +86,9 @@ export default function mayflyExtension(pi: ExtensionAPI) {
   let sessionCtx: ExtensionContext | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let timerDue = Infinity;
+  /** Set while the watcher is retrying after a transient error; cleared after a quiet stretch. */
+  let reconnecting = false;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   const profile = (): Profile => config?.profile ?? mergeProfile();
 
@@ -119,6 +132,52 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     });
   }
 
+  // --- footer status ---------------------------------------------------------
+  // A clickable link (OSC 8) to the chat: the label is visible, the URL (with its #key) is not printed.
+
+  const STATUS_KEY = "mayfly";
+
+  function refreshStatus() {
+    const ctx = sessionCtx;
+    if (!ctx?.hasUI) return;
+    try {
+      if (!channel || !inbox || !config) return ctx.ui.setStatus(STATUS_KEY, undefined);
+      const label = statusLabel({
+        name: channel.name,
+        wake: profile().wake,
+        unseen: inbox.unseenCount,
+        addressed: inbox.pending.length,
+        paused: inbox.budget.isPaused,
+        reconnecting,
+      });
+      ctx.ui.setStatus(STATUS_KEY, "💬 " + osc8(config.url, label));
+    } catch {
+      /* status is cosmetic; never let it break delivery */
+    }
+  }
+
+  function noteTransientError(retryInMs: number) {
+    reconnecting = true;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    // No error for a full long-poll cycle after the retry means we're healthy again.
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      reconnecting = false;
+      refreshStatus();
+    }, retryInMs + 60_000);
+    reconnectTimer.unref?.();
+    refreshStatus();
+  }
+
+  function openChat(): string {
+    if (!config || !channel) return "Not in a Mayfly channel.";
+    const { cmd, args } = browserCommand(config.url);
+    const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
+    child.on("error", () => {});
+    child.unref();
+    return `Opened ${channel.redactedUrl} in your browser.`;
+  }
+
   // --- delivery ----------------------------------------------------------------
 
   function schedule(ms: number) {
@@ -156,9 +215,11 @@ export default function mayflyExtension(pi: ExtensionAPI) {
         // Idle: wake a fresh turn. Busy: queue so it is handled after the current run.
         busy ? { triggerTurn: true, deliverAs: "followUp" } : { triggerTurn: true },
       );
+      refreshStatus();
     } else if (a.kind === "throttled") {
       schedule(a.retryInMs + 100);
     } else if (a.kind === "paused" && a.justPaused) {
+      refreshStatus();
       const p = profile().budget;
       void channel.post(`⏸ ${channel.name} paused auto-wake: wake budget exhausted (${p.hourlyCap} wakes/hour). It resumes after ${p.quietResumeMinutes} min without addressed messages, or via /mayfly resume.`);
       sessionCtx?.ui.notify(
@@ -185,6 +246,12 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     // Don't start new work right after a stop; what arrived stays buffered for the next wake.
     if (stopped) clearTimer();
     else if (want) schedule(COALESCE_MS);
+    if (reconnecting) {
+      reconnecting = false;
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+    refreshStatus();
   }
 
   function startWatch(since?: number) {
@@ -197,6 +264,7 @@ export default function mayflyExtension(pi: ExtensionAPI) {
         since,
         onError: (e, retryInMs) => {
           sessionCtx?.ui.notify(`Mayfly: transient error (${e.message}); retrying in ${Math.round(retryInMs / 1000)}s`, "warning");
+          noteTransientError(retryInMs);
         },
       })
       .catch((e) => {
@@ -217,6 +285,10 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     watcher = null;
     channel = null;
     inbox = null;
+    reconnecting = false;
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    refreshStatus();
   }
 
   /** Resolve defaults ← profile file ← overrides into a JoinConfig. Throws on bad input. */
@@ -226,7 +298,8 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     const overrides = req.overrides ? validateProfile(req.overrides, "join options") : undefined;
     const prof = mergeProfile(file?.profile, overrides);
     const name = req.name?.trim() || prof.name || `Pi-${Math.random().toString(36).slice(2, 6)}`;
-    return { url: req.url, name, profile: prof, profilePath: file?.path };
+    const task = req.task?.trim().replace(/\s+/g, " ") || undefined;
+    return { url: req.url, name, profile: prof, profilePath: file?.path, ...(task ? { task } : {}) };
   }
 
   function normalizeSaved(cfg: JoinConfig): JoinConfig {
@@ -236,6 +309,8 @@ export default function mayflyExtension(pi: ExtensionAPI) {
   }
 
   function join(cfg: JoinConfig, ctx: ExtensionContext, persist: boolean, since?: number): string {
+    // Explicit joins never silently switch channels.
+    if (persist && channel) throw new Error(`Already connected to ${channel.redactedUrl} as "${channel.name}". ${ONE_CHANNEL}`);
     // Validate the new URL/name before leaving the current channel, so a bad join changes nothing.
     const ch = openChannel(cfg.url, cfg.name);
     teardown();
@@ -249,9 +324,12 @@ export default function mayflyExtension(pi: ExtensionAPI) {
       // NOTE: cfg.url contains the #key (a password) and is written to the session file so a
       // resumed session can rejoin automatically.
       pi.appendEntry<JoinConfig>("mayfly-join", config);
+      // Introduce ourselves on an explicit join (not on silent auto-rejoin after a restart).
+      void ch.post(introMessage(ch.name, config.profile!, config.task)).catch(() => {});
     }
     const summary = `Watching ${ch.redactedUrl} as "${ch.name}" (wake: ${config.profile!.wake}${config.profile!.groups.length ? `, groups: ${config.profile!.groups.join(", ")}` : ""}).`;
     if (ctx.hasUI) ctx.ui.notify(`Mayfly: ${summary}`, "info");
+    refreshStatus();
     return summary;
   }
 
@@ -279,6 +357,7 @@ export default function mayflyExtension(pi: ExtensionAPI) {
       : `${b.tokens}/${b.burst} tokens, ${b.wakesLastHour}/${b.hourlyCap} wakes this hour`;
     return [
       `Watching ${channel.redactedUrl} as "${channel.name}"${config?.profilePath ? ` (profile ${config.profilePath})` : ""}`,
+      `task: ${config?.task ?? "(not stated)"}`,
       `wake: ${p.wake}; groups: ${p.groups.length ? p.groups.map((g) => "@" + g).join(" ") : "(none)"}; bare-name mentions: ${p.requireAtForMention ? "off" : "on"}`,
       `budget: ${budget}`,
       `unseen: ${inbox.unseenCount} (${inbox.pending.length} addressed); cursor #${channel.last}; remote stop: ${allow}`,
@@ -292,6 +371,7 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     inbox.setProfile(config.profile!);
     pi.appendEntry("mayfly-wake", upd);
     if (inbox.wantsWake()) schedule(COALESCE_MS);
+    refreshStatus();
     const p = config.profile!;
     return `Wake policy is now "${p.wake}"${p.groups.length ? `; groups: ${p.groups.map((g) => "@" + g).join(" ")}` : ""}.`;
   }
@@ -301,13 +381,25 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     const was = inbox.budget.isPaused;
     inbox.resume();
     if (inbox.wantsWake()) schedule(COALESCE_MS);
+    refreshStatus();
     return was ? "Auto-wake resumed; the wake budget was reset." : "Auto-wake was not paused; the wake budget was reset.";
   }
 
-  async function newChannel(origin: string | undefined, name: string | undefined, andJoin: boolean, ctx: ExtensionContext) {
+  async function setTask(task: string): Promise<string> {
+    if (!config || !channel) return "Not in a Mayfly channel.";
+    const t = task.trim().replace(/\s+/g, " ");
+    if (!t) throw new Error("task must be nonblank");
+    config = { ...config, task: t };
+    pi.appendEntry("mayfly-task", { task: t });
+    const r = await channel.post(taskUpdateMessage(channel.name, t));
+    return r.posted === true ? `Task updated and announced (#${r.id}).` : `Task updated locally; the announcement was not posted (${r.error ?? (r.conflict ? "conflict" : "unknown")}).`;
+  }
+
+  async function newChannel(origin: string | undefined, name: string | undefined, andJoin: boolean, ctx: ExtensionContext, task?: string) {
+    if (andJoin && channel) throw new Error(`Already connected to ${channel.redactedUrl} as "${channel.name}". ${ONE_CHANNEL}`);
     const created = await createChannel(origin || DEFAULT_ORIGIN);
     let joined = "";
-    if (andJoin) joined = " " + join(resolveJoin({ url: created.url, name }, ctx.cwd), ctx, true);
+    if (andJoin) joined = " " + join(resolveJoin({ url: created.url, name, task }, ctx.cwd), ctx, true);
     return { created, joined };
   }
 
@@ -328,6 +420,8 @@ export default function mayflyExtension(pi: ExtensionAPI) {
         since = undefined;
       } else if (entry.customType === "mayfly-cursor") {
         if (typeof data?.last === "number") since = data.last;
+      } else if (entry.customType === "mayfly-task" && saved) {
+        if (typeof data?.task === "string" && data.task.trim()) saved = { ...saved, task: data.task };
       } else if (entry.customType === "mayfly-wake" && saved) {
         try {
           saved = { ...saved, profile: mergeProfile(saved.profile, validateProfile(data, "saved wake")) };
@@ -344,22 +438,25 @@ export default function mayflyExtension(pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
-    teardown();
+    teardown(); // also clears the footer status
     sessionCtx = null;
   });
 
   // --- /mayfly command -------------------------------------------------------
   const USAGE = [
-    "/mayfly join <url> [name] [--profile=<path|name>] [--wake=addressed|all|none] [--groups=a,b] [--mention-only] [--no-stop | --stop-from=A,B]",
-    "/mayfly new [origin] [name]   (create a channel and join it)",
+    "/mayfly join <url> [name] [--profile=<path|name>] [--wake=addressed|all|none] [--groups=a,b] [--mention-only] [--no-stop | --stop-from=A,B] [-- <task>]",
+    "/mayfly new [origin] [name] [-- <task>]   (create a channel and join it)",
     "/mayfly wake <addressed|all|none> [groups]",
+    "/mayfly task <what you're working on>   (announce a new task)",
+    "/mayfly open   (open the chat in your browser)",
     "/mayfly resume | leave | status",
   ].join("\n");
 
   pi.registerCommand("mayfly", {
-    description: "Mayfly chat: join <url> [name] [--profile=…] [--wake=…] [--groups=…] | new [origin] [name] | wake <policy> | resume | leave | status",
-    handler: async (args, ctx) => {
+    description: "Mayfly chat: join <url> [name] [--…] [-- task] | new [origin] [name] [-- task] | task <text> | open | wake <policy> | resume | leave | status",
+    handler: async (rawArgs, ctx) => {
       sessionCtx = ctx;
+      const { args, task: taskArg } = splitTaskArg(rawArgs);
       const tokens = args.trim().split(/\s+/).filter(Boolean);
       const sub = (tokens.shift() ?? "status").toLowerCase();
       const flag = (n: string) => {
@@ -392,13 +489,13 @@ export default function mayflyExtension(pi: ExtensionAPI) {
           const rest = tokens.filter((t) => !t.startsWith("--"));
           const url = rest.shift() ?? process.env.MAYFLY_URL;
           if (!url) return ctx.ui.notify(`Usage: ${USAGE.split("\n")[0]} (or set $MAYFLY_URL)`, "warning");
-          const cfg = resolveJoin({ url, name: rest.join(" ") || undefined, profile: profileSpec || undefined, overrides }, ctx.cwd);
+          const cfg = resolveJoin({ url, name: rest.join(" ") || undefined, profile: profileSpec || undefined, overrides, task: taskArg }, ctx.cwd);
           join(cfg, ctx, true);
           return;
         }
         if (sub === "new") {
           const origin = tokens[0] && /^https?:\/\//i.test(tokens[0]) ? tokens.shift() : undefined;
-          const { created, joined } = await newChannel(origin, tokens.join(" ") || undefined, true, ctx);
+          const { created, joined } = await newChannel(origin, tokens.join(" ") || undefined, true, ctx, taskArg);
           // The human asked for it, so show the full URL (it's how they share the channel).
           ctx.ui.notify(`Mayfly: created ${created.url}  (secret: anyone with this URL can read, post, and delete)${joined}`, "info");
           return;
@@ -408,6 +505,13 @@ export default function mayflyExtension(pi: ExtensionAPI) {
           if (!WAKE_POLICIES.includes(policy)) return ctx.ui.notify(`Usage: ${USAGE.split("\n")[2]}`, "warning");
           return ctx.ui.notify(`Mayfly: ${setWake(policy, tokens.length ? list(tokens.join(",")) : undefined)}`, "info");
         }
+        if (sub === "task") {
+          // `/mayfly task <text>` (the rest of the raw line, so no `--` needed).
+          const t = rawArgs.trim().replace(/^task\s*/i, "").replace(/^--\s*/, "");
+          if (!t) return ctx.ui.notify(`Mayfly: task: ${config?.task ?? "(not stated)"}. Usage: /mayfly task <what you're working on>`, "info");
+          return ctx.ui.notify(`Mayfly: ${await setTask(t)}`, "info");
+        }
+        if (sub === "open") return ctx.ui.notify(`Mayfly: ${openChat()}`, "info");
         if (sub === "resume") return ctx.ui.notify(`Mayfly: ${resume()}`, "info");
         if (sub === "leave") return ctx.ui.notify(`Mayfly: ${await leave()}`, "info");
         if (sub === "status") return ctx.ui.notify(`Mayfly: ${status()}`, "info");
@@ -429,8 +533,9 @@ export default function mayflyExtension(pi: ExtensionAPI) {
         "Join a Mayfly chat channel and start watching it in the background. Use when the user gives you a Mayfly " +
         "URL (https://host/c/ID#key) and asks you to join or participate. By default you are dark: you are only woken " +
         "when a message is addressed to you (@yourName, a /re reply to one of your messages, @all, or @group for your " +
-        "groups); everything else is recorded and shown as context on your next wake. The #key in the URL is a secret: " +
-        "never repeat it in chat or output.",
+        "groups); everything else is recorded and shown as context on your next wake. You post a short intro with " +
+        "your task on joining. One chat per agent: if you are already connected, leave first, or start a subagent for " +
+        "another channel. The #key in the URL is a secret: never repeat it in chat or output.",
       promptSnippet: "mayfly_join — join a Mayfly chat channel (watch in background; woken only when addressed).",
       parameters: Type.Object({
         url: Type.String({ description: "Full channel URL including #key." }),
@@ -438,16 +543,26 @@ export default function mayflyExtension(pi: ExtensionAPI) {
         profile: Type.Optional(Type.String({ description: "Profile JSON path, or a bundled profile name (default, subscribed, reviewer)." })),
         wake: Type.Optional(StringEnum(WAKE_POLICIES, "addressed (default): wake only when addressed; all: wake on every message; none: never auto-wake (poll with mayfly_read).")),
         groups: Type.Optional(Type.Array(Type.String(), { description: "Group tags: @<group> messages address you, e.g. [\"reviewers\"]." })),
+        task: Type.String({
+          description:
+            "One sentence on what you are working on and what others can ask you for. It is posted in your join " +
+            "message so other agents and people understand your objective and scope. Don't include secrets.",
+        }),
       }),
       async execute(_id, params, _signal, _onUpdate, ctx) {
         sessionCtx = ctx;
-        if (channel && !params.url.includes("#") && params.url.trim().replace(/\/+$/, "") === channel.redactedUrl)
+        if (channel && params.url.trim().replace(/#.*$/, "").replace(/\/+$/, "") === channel.redactedUrl)
           return text(`Already connected to ${channel.redactedUrl} as "${channel.name}". Post with mayfly_post; see mayfly_status.`);
+        if (channel) return text(`Already connected to ${channel.redactedUrl} as "${channel.name}". ${ONE_CHANNEL}`, true);
         try {
           const overrides: ProfileInput = {};
           if (params.wake) overrides.wake = params.wake;
           if (params.groups) overrides.groups = params.groups;
-          const summary = join(resolveJoin({ url: params.url, name: params.name, profile: params.profile, overrides }, ctx.cwd), ctx, true);
+          const summary = join(
+            resolveJoin({ url: params.url, name: params.name, profile: params.profile, overrides, task: params.task }, ctx.cwd),
+            ctx,
+            true,
+          );
           return text(`${summary} Messages addressed to you will arrive automatically; post with mayfly_post.`);
         } catch (e: any) {
           return text(`Join failed: ${e?.message ?? e}`, true);
@@ -468,11 +583,12 @@ export default function mayflyExtension(pi: ExtensionAPI) {
         origin: Type.Optional(Type.String({ description: `Server origin (default ${DEFAULT_ORIGIN}).` })),
         name: Type.Optional(Type.String({ description: "Your chat name when joining." })),
         join: Type.Optional(Type.Boolean({ description: "Join the new channel (default true)." })),
+        task: Type.Optional(Type.String({ description: "When joining: one sentence on what you're working on (posted in your intro)." })),
       }),
       async execute(_id, params, _signal, _onUpdate, ctx) {
         sessionCtx = ctx;
         try {
-          const { created, joined } = await newChannel(params.origin, params.name, params.join !== false, ctx);
+          const { created, joined } = await newChannel(params.origin, params.name, params.join !== false, ctx, params.task);
           return text(
             `Created channel: ${created.url}\nThis URL is a secret (anyone with it can read, post, and delete the channel). ` +
               `Share it only with intended participants; refer to it elsewhere as ${created.redactedUrl}.${joined}`,
@@ -548,6 +664,27 @@ export default function mayflyExtension(pi: ExtensionAPI) {
       async execute() {
         if (!channel) return notJoined;
         return text(resume());
+      },
+    }),
+  );
+
+  pi.registerTool(
+    defineTool({
+      name: "mayfly_set_task",
+      label: "Mayfly Set Task",
+      description:
+        "Announce in the Mayfly channel that your task changed (posts '📝 <you> is now working on: …'). Use when your " +
+        "objective or scope changes substantially, so others know what you are doing and what to ask you for.",
+      parameters: Type.Object({
+        task: Type.String({ description: "One sentence on your new task. Don't include secrets." }),
+      }),
+      async execute(_id, params) {
+        if (!channel) return notJoined;
+        try {
+          return text(await setTask(params.task));
+        } catch (e: any) {
+          return text(`${e?.message ?? e}`, true);
+        }
       },
     }),
   );
@@ -657,10 +794,13 @@ export default function mayflyExtension(pi: ExtensionAPI) {
         if (!channel || !inbox) return notJoined;
         if (params.unread) {
           if (!inbox.unseenCount) return text("(no unseen messages)");
-          return text(inbox.take(header(), [], "Use mayfly_read with count to see older history.").content);
+          const out = inbox.take(header(), [], "Use mayfly_read with count to see older history.").content;
+          refreshStatus();
+          return text(out);
         }
         const msgs = await channel.history(Math.min(500, params.count ?? 20));
         if (msgs.length) inbox.markSeen(msgs[0].seq, msgs[msgs.length - 1].seq);
+        refreshStatus();
         return text(msgs.length ? formatMessages(msgs) : "(no messages yet)", false, { count: msgs.length });
       },
     }),
