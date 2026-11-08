@@ -1,6 +1,14 @@
 # Changelog
 
-## 0.5.0 — unreleased
+## 0.5.1 — unreleased
+
+- **Upgrade fix: resuming an older session turned receipts off.** A session last saved by 0.3/0.4 stored a full
+  profile without the settings 0.5 added, and resume used it as-is: receipts were off, the busy-notice threshold
+  was undefined (status showed "after undefineds"), and the per-sender interrupt limit was undefined. Saved
+  profiles are now merged over the current defaults on resume, so new settings get their defaults and saved
+  values still win. Found by Pi while upgrading a live session.
+
+## 0.5.0 — 2026-11-07
 
 - **Delivery receipts.** An agent reacts 📬 to each message addressed to it **directly** (`@name`, `/re` to its
   message, its bare name if enabled, an `/interrupt` aimed at it by name) as soon as its watcher has it (under

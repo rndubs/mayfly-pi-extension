@@ -179,6 +179,34 @@ describe("extension wiring against a local Mayfly server", { skip }, () => {
     assert.equal(P2.wakes().length, 0);
   });
 
+  test("resume: a profile saved by 0.4.x is backfilled with settings added later (receipts on, limits set)", async () => {
+    const { url } = await createChannel(srv.origin);
+    // Exactly what 0.4.1 persisted: a full profile, but without receipts / busyNoticeAfterSec / budget.interruptsPerHour.
+    const saved041 = {
+      groups: [],
+      wake: "addressed",
+      context: { recentK: 7, maxBytes: 16384 }, // a user-set value that must survive
+      budget: { burst: 6, refillPerMinute: 1, hourlyCap: 30, quietResumeMinutes: 10 },
+      allowStop: "anyone",
+      requireAtForMention: true,
+    };
+    const A = await pi([{ type: "custom", customType: "mayfly-join", data: { url, name: "A", profile: saved041 } }]);
+    await sleep(500);
+    const st = (await A.call("mayfly_status", {})).content[0].text;
+    assert.doesNotMatch(st, /undefined|NaN/, st);
+    assert.match(st, /receipts: on/, st);
+    // Receipts actually work after resume: an addressed message gets A's 📬.
+    const h = open(url, "H");
+    const r = await h.post("@A ping after upgrade");
+    let hist = await h.history(20);
+    for (let i = 0; i < 40 && reactsBy(hist, "A", r.id!, "📬") < 1; i++) {
+      await sleep(200);
+      hist = await h.history(20);
+    }
+    assert.equal(reactsBy(hist, "A", r.id!, "📬"), 1, "A posts 📬 after resuming a 0.4.x session");
+    await until(() => A.wakes().length >= 1, 8000, "the addressed wake");
+  });
+
   test("a /stop that isn't allowed doesn't cancel a pending (throttled) wake", async () => {
     const { url } = await createChannel(srv.origin);
     const fast = profileFile("fast", { budget: { burst: 1, refillPerMinute: 20 } }); // retry after 3 s
