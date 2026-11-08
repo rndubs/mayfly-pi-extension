@@ -19,10 +19,32 @@ import {
   MayflyFatalError,
   type MayflyMessage,
   openChannel,
+  parseInterrupt,
   parseStop,
+  type PostResult,
 } from "./mayfly-core.js";
-import { Inbox, stopTargetsMe } from "./policy.js";
-import { browserCommand, introMessage, osc8, splitTaskArg, statusLabel, taskUpdateMessage } from "./presence.js";
+import { directReason, Inbox, stopTargetsMe, type Taken, targetsMeByName, type WakeAction } from "./policy.js";
+import {
+  ackText,
+  BACKOFF,
+  backoffDelay,
+  BusyTracker,
+  describeReceipts,
+  formatDuration,
+  isReceiptChatter,
+  isReceiptReaction,
+  noReceiptsExpected,
+  parseBusyNotice,
+  parseReact,
+  quoteTarget,
+  ReactionQueue,
+  RECEIVED,
+  type ReceiptLevel,
+  ReceiptTracker,
+  resolveTargets,
+  SEEN,
+} from "./receipts.js";
+import { parseIntro, browserCommand, introMessage, osc8, splitTaskArg, statusLabel, taskUpdateMessage } from "./presence.js";
 import {
   type AllowStop,
   loadProfileFile,
@@ -67,6 +89,39 @@ const ONE_CHANNEL =
 const DEFAULT_ORIGIN = "https://mayfly.chat";
 /** Coalesce batches arriving back-to-back (e.g. several pages on resume) into one wake. */
 const COALESCE_MS = 250;
+/** After a run ends, how long to wait before treating a never-seen injection as lost (and requeueing it). */
+const LOST_INJECTION_MS = 1000;
+/** mayfly_post waitFor: default and max wait. */
+const WAIT_DEFAULT_SEC = 60;
+const WAIT_MAX_SEC = 600;
+
+/** mayfly_post/_stop/_interrupt: retries of a post that lost a race only to automatic chatter. */
+const TOOL_POST_RETRIES = 5;
+/** Injected wakes tracked until they reach the model (message_start). */
+const INFLIGHT_MAX = 500;
+
+/** Keep a Set/Map bounded (insertion order: oldest first). Returns how many entries were evicted. */
+function bound<K>(c: { size: number; keys(): IterableIterator<K>; delete(k: K): boolean }, max: number): number {
+  let n = 0;
+  for (; c.size > max; n++) c.delete(c.keys().next().value as K);
+  return n;
+}
+
+/** Sleep `ms`; resolves early (false) if `signal` aborts. */
+function pause(ms: number, signal?: AbortSignal): Promise<boolean> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) return resolve(false);
+    const t = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve(true);
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(t);
+      resolve(false);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
 
 const StringEnum = <T extends string>(values: readonly T[], description: string) =>
   Type.Unsafe<T>({ type: "string", enum: [...values], description });
@@ -89,6 +144,34 @@ export default function mayflyExtension(pi: ExtensionAPI) {
   /** Set while the watcher is retrying after a transient error; cleared after a quiet stretch. */
   let reconnecting = false;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Receipts (per channel; reset on join).
+  /** Reactions on our own messages (sender side). */
+  let receipts = new ReceiptTracker(200);
+  /** Our 📬/👀 reactions (recipient side). */
+  let reactions: ReactionQueue | null = null;
+  /** Names seen in the channel, for resolving whom our posts address. */
+  const participants = new Set<string>();
+  /** Group tags other agents announced in their join intros (for receipt targets: @group means any member). */
+  const knownGroups = new Set<string>();
+  /** seq → author, for "/re N" targets. */
+  const authors = new Map<number, string>();
+  /** Addressed seqs our watcher received this session (they get 👀 once the model sees them). */
+  const receivedAddressed = new Set<number>();
+  /** Injected wakes not yet seen in the model's context (message_start), by details.id. */
+  const inflight = new Map<string, { taken: Taken; sentAt: number }>();
+  /** Injected wakes evicted from `inflight` unconfirmed (shown in status; should stay 0). */
+  let inflightOverflow = 0;
+  let injectCount = 0;
+  /** When the last run ended (for requeueing injections it never consumed). */
+  let lastAgentEndAt = 0;
+  /** Aborted on teardown: cancels background-post backoff sleeps. */
+  let bgAbort = new AbortController();
+  /** /interrupts being handled; ordinary wakes wait for them (the urgent wake takes everything buffered). */
+  let urgent = 0;
+
+  // Busy state (per session): which tool calls are running, for the busy notice and the ⚡ reply.
+  const busy = new BusyTracker();
 
   const profile = (): Profile => config?.profile ?? mergeProfile();
 
@@ -129,9 +212,209 @@ export default function mayflyExtension(pi: ExtensionAPI) {
       },
       { triggerTurn: false },
     );
-    void ch.post(wasBusy ? `⏹ ${ch.name} stopped (running work aborted).` : `⏹ ${ch.name} was idle — nothing to stop.`, {
-      replyTo: m.seq,
-    });
+    // Acks are plain text (no /re, no @), so they wake nobody; the sender has receipts for delivery.
+    void bgPost(ackText("⏹", ch.name, wasBusy ? "stopped (running work aborted)" : "was idle — nothing to stop", m));
+  }
+
+  /**
+   * Urgent `/interrupt` (the caller checked stopAllowed() and the sender's interrupt limit). Busy: abort the running
+   * work (bash kills its process tree), wait (bounded) for the run to settle, then wake with the message and a note
+   * to decide whether to resume. Idle: an ordinary addressed wake. Either way it bypasses the wake budget's throttle
+   * and pause, but counts toward the hourly cap.
+   */
+  async function handleInterrupt(m: MayflyMessage, message: string | undefined) {
+    const ctx = sessionCtx;
+    const ch = channel;
+    try {
+      if (!ctx || !ch || !inbox) return;
+      const stale = () => channel !== ch || sessionCtx !== ctx;
+      const running = busy.current();
+      const wasBusy = !ctx.isIdle();
+      if (wasBusy) ctx.abort();
+      ctx.ui.notify(`Mayfly: ${wasBusy ? "interrupted" : "urgent message"} by ${m.from} (#${m.seq})${message ? ` — ${message}` : ""}`, "warning");
+      for (let i = 0; i < 50 && !ctx.isIdle() && !stale(); i++) await new Promise((r) => setTimeout(r, 200));
+      if (stale() || !inbox) return;
+      // A wake steered into the aborted run may have been dropped with it: put it back so it rides along (in RPC
+      // mode Pi may still deliver the stale steer later; message_start then drops those seqs from the inbox).
+      requeueInflight(() => true);
+      const what = message ? `: ${message}` : ".";
+      const note = wasBusy
+        ? `${m.from} interrupted your current work via Mayfly (#${m.seq})${what} Decide whether to resume the interrupted work after handling this.`
+        : `${m.from} sent you an urgent message via Mayfly (#${m.seq})${what}`;
+      inject(inbox.attemptUrgent(header(), m, note));
+      refreshStatus();
+      const tool = running ? `${running.name}, ${formatDuration(running.runningMs)}` : "a turn";
+      void bgPost(ackText("⚡", ch.name, wasBusy ? `interrupted (was running ${tool}) — handling it` : "was idle — handling it", m));
+    } finally {
+      urgent = Math.max(0, urgent - 1);
+      if (!urgent && inbox?.wantsWake()) schedule(COALESCE_MS);
+    }
+  }
+
+  // --- background posts and receipts -----------------------------------------------
+
+  /**
+   * Post something the model didn't ask for (receipts, notices, replies). Messages from others that the post
+   * reveals are handed to deliver(), not dropped. A conflict is retried with jittered exponential backoff
+   * (200 ms → 5 s) for up to a minute, or until we leave the channel. An uncertain result is never retried.
+   */
+  async function bgPost(text: string, opts?: { replyTo?: number }, react?: { seq: number; emoji: string }): Promise<PostResult | undefined> {
+    const ch = channel;
+    const signal = bgAbort.signal;
+    if (!ch) return;
+    const start = Date.now();
+    for (let attempt = 0; channel === ch; attempt++) {
+      let r: PostResult;
+      try {
+        r = react ? await ch.react(react.seq, react.emoji) : await ch.post(text, opts);
+      } catch {
+        return;
+      }
+      if (channel === ch && r.newMessages.length) deliver(r.newMessages);
+      if (!r.conflict) return r;
+      const delay = backoffDelay(attempt);
+      if (Date.now() - start + delay > BACKOFF.giveUpMs || !(await pause(delay, signal))) return r;
+    }
+  }
+
+  /**
+   * Post for the model. A conflict is retried automatically (bounded) only when EVERY event that raced the post
+   * is automatic chatter (receipts, busy notices, acks) — judged on the raw 409 page, before dedup, so a message
+   * the watcher already delivered still counts. Otherwise the conflict goes back to the model.
+   */
+  async function toolPost(text: string, opts?: { replyTo?: number }): Promise<PostResult> {
+    const ch = channel!;
+    for (let i = 0; ; i++) {
+      const r = await ch.post(text, opts);
+      const raced = r.conflictEvents ?? r.newMessages;
+      if (!r.conflict || i >= TOOL_POST_RETRIES || channel !== ch || !raced.every((m) => isReceiptChatter(m.text))) return r;
+      deliver(r.newMessages);
+      if (!(await pause(backoffDelay(i), bgAbort.signal))) return r;
+    }
+  }
+
+  /**
+   * Messages from others to show in a tool result. On a conflict that is everything that raced the post (minus
+   * 📬/👀 receipts), including messages the watcher had already recorded: those are now shown, so they leave the
+   * inbox (and get 👀). Otherwise just the new messages.
+   */
+  function shownOthers(res: PostResult): MayflyMessage[] {
+    if (!res.conflict || !res.conflictEvents) return res.newMessages;
+    const fresh = new Set(res.newMessages.map((m) => m.seq));
+    const earlier = res.conflictEvents.filter((m) => !fresh.has(m.seq) && !isReceiptReaction(m.text));
+    if (earlier.length && inbox) {
+      const seqs = earlier.map((m) => m.seq);
+      inbox.forgetSeqs(seqs);
+      markSeenSeqs(seqs);
+      refreshStatus();
+    }
+    return [...earlier, ...res.newMessages].sort((x, y) => x.seq - y.seq);
+  }
+
+  /** The tool-result line for a conflict. */
+  function conflictLine(shown: MayflyMessage[], what: string): string {
+    return shown.some((m) => !isReceiptChatter(m.text))
+      ? `Conflict: someone posted first — your ${what} was NOT sent. Reconsider the messages below, then post again if still needed.`
+      : `Conflict: the channel was busy with automatic receipts — your ${what} was NOT sent. Post it again.`;
+  }
+
+  /** Addressed to us directly (@name, /re to our message, bare name if enabled): only these get receipts. */
+  function isDirect(m: MayflyMessage): boolean {
+    return !!channel && directReason(m, { name: channel.name, ownSeqs: channel.ownSeqs }, profile()) !== null;
+  }
+
+  /** Learn names, authors, receipts and busy notices for our own messages, and (from history) our own receipts. */
+  function learn(msgs: MayflyMessage[]) {
+    const ch = channel;
+    if (!ch) return;
+    for (const m of msgs) {
+      if (!m.from) continue;
+      participants.delete(m.from);
+      participants.add(m.from);
+      authors.set(m.seq, m.from);
+      if (m.from === ch.name) {
+        // Our own earlier receipts (seen in history after a restart): don't post them again.
+        const r = parseReact(m.text);
+        if (r && !r.un && (r.emoji === RECEIVED || r.emoji === SEEN)) reactions?.remember(`${r.seq}:${r.emoji}`);
+        continue;
+      }
+      const r = parseReact(m.text);
+      if (r && !r.un && ch.ownSeqs.has(r.seq)) receipts.noteReaction(m.from, r.seq, r.emoji);
+      const b = parseBusyNotice(m.text);
+      if (b && ch.ownSeqs.has(b.seq)) receipts.noteBusy(m.from, b.seq, b.tool, b.running);
+      const intro = parseIntro(m.text);
+      if (intro && intro.name === m.from) for (const g of intro.groups) knownGroups.add(g);
+    }
+    bound(participants, 500);
+    bound(knownGroups, 500);
+    bound(authors, 2000);
+  }
+
+  /**
+   * The watcher has these (non-control) messages: react 📬 to the ones addressed to us directly (not @all or
+   * @group); maybe post a busy notice (same rule).
+   */
+  function ackReceived(msgs: MayflyMessage[]) {
+    const ch = channel;
+    if (!ch) return;
+    const p = profile();
+    for (const m of msgs) {
+      if (!isDirect(m)) continue;
+      receivedAddressed.add(m.seq);
+      if (p.receipts) reactions?.enqueue(m.seq, RECEIVED);
+      if (p.busyNoticeAfterSec !== false && sessionCtx && !sessionCtx.isIdle()) {
+        const notice = busy.check(m.from, m.seq, ch.name, p.busyNoticeAfterSec * 1000);
+        if (notice) void bgPost(notice);
+      }
+    }
+    bound(receivedAddressed, 2000);
+  }
+
+  /** These seqs are now in the model's context: react 👀 to the addressed ones we received. */
+  function markSeenSeqs(seqs: Iterable<number>) {
+    if (!profile().receipts) return;
+    for (const s of seqs) if (receivedAddressed.has(s)) reactions?.enqueue(s, SEEN);
+  }
+
+  /** Messages from others returned in a tool result (the model sees them there). */
+  function observeShown(msgs: MayflyMessage[]) {
+    if (!channel || !msgs.length) return;
+    const control: MayflyMessage[] = [];
+    const rest: MayflyMessage[] = [];
+    for (const m of msgs) (parseStop(m.text) || parseInterrupt(m.text) ? control : rest).push(m);
+    if (control.length) deliver(control);
+    learn(rest);
+    for (const m of rest) if (isDirect(m)) receivedAddressed.add(m.seq);
+    markSeenSeqs(rest.map((m) => m.seq));
+  }
+
+  /** Inject a wake into the conversation. Busy: steer it in after the current tool round. Idle: start a turn. */
+  function inject(a: Extract<WakeAction, { kind: "wake" }>) {
+    const id = `${Date.now().toString(36)}-${++injectCount}`;
+    inflight.set(id, { taken: a.taken, sentAt: Date.now() });
+    inflightOverflow += bound(inflight, INFLIGHT_MAX);
+    const isBusy = sessionCtx ? !sessionCtx.isIdle() : false;
+    // If the run ends before Pi processes this, Pi itself starts a turn for it (triggerTurn while idle), and
+    // deliverAs is ignored. A steer dropped by an abort is put back (held) by the agent_end check.
+    pi.sendMessage(
+      { customType: "mayfly", content: a.content, display: true, details: { id, seqs: a.seqs, addressed: a.addressedSeqs } },
+      isBusy ? { triggerTurn: true, deliverAs: "steer" } : { triggerTurn: true },
+    );
+  }
+
+  /**
+   * Put the messages of never-seen injections back into the inbox, held: no wake is scheduled for them. They ride
+   * along with the next wake, user turn, mayfly_resume, or mayfly_read unread. Returns how many were requeued.
+   */
+  function requeueInflight(pred: (sentAt: number) => boolean): number {
+    let n = 0;
+    for (const [id, e] of inflight) {
+      if (!pred(e.sentAt)) continue;
+      inflight.delete(id);
+      inbox?.requeue(e.taken);
+      n++;
+    }
+    return n;
   }
 
   // --- footer status ---------------------------------------------------------
@@ -208,15 +491,12 @@ export default function mayflyExtension(pi: ExtensionAPI) {
 
   function attemptWake() {
     if (!channel || !inbox) return;
+    // An /interrupt is being handled: its urgent wake will carry everything buffered.
+    if (urgent) return;
     const a = inbox.attempt(header());
     if (a.kind === "wake") {
       if (a.resumed) sessionCtx?.ui.notify("Mayfly: auto-wake resumed after a quiet period", "info");
-      const busy = sessionCtx ? !sessionCtx.isIdle() : false;
-      pi.sendMessage(
-        { customType: "mayfly", content: a.content, display: true },
-        // Idle: wake a fresh turn. Busy: queue so it is handled after the current run.
-        busy ? { triggerTurn: true, deliverAs: "followUp" } : { triggerTurn: true },
-      );
+      inject(a);
       refreshStatus();
     } else if (a.kind === "throttled") {
       schedule(a.retryInMs + 100);
@@ -227,7 +507,7 @@ export default function mayflyExtension(pi: ExtensionAPI) {
       if (!a.justPaused) return;
       refreshStatus();
       const p = profile().budget;
-      void channel.post(`⏸ ${channel.name} paused auto-wake: wake budget exhausted (${p.hourlyCap} wakes/hour). It resumes after ${p.quietResumeMinutes} min without addressed messages, or via /mayfly resume.`);
+      void bgPost(`⏸ ${channel.name} paused auto-wake: wake budget exhausted (${p.hourlyCap} wakes/hour). It resumes after ${p.quietResumeMinutes} min without addressed messages, or via /mayfly resume.`);
       sessionCtx?.ui.notify(
         `Mayfly: auto-wake paused (wake budget exhausted). Messages are still recorded. Use /mayfly resume or wait ${p.quietResumeMinutes} quiet minutes.`,
         "warning",
@@ -238,10 +518,40 @@ export default function mayflyExtension(pi: ExtensionAPI) {
   // One poll's worth of messages from others.
   function deliver(incoming: MayflyMessage[]) {
     if (!channel || !inbox) return;
-    // /stop aimed at us is handled here and never reaches the model or wakes a turn.
+    learn(incoming);
+    // /stop aimed at us is handled here and never reaches the model or wakes a turn. /interrupt aimed at us is
+    // handled here too, and delivered as an urgent wake (within the sender's interrupt limit).
     let stopped = false;
+    let interrupted = false;
     const rest: MayflyMessage[] = [];
+    const downgraded: MayflyMessage[] = [];
+    const receipt = (m: MayflyMessage, target: string) => {
+      // Receipts only for an interrupt aimed at us by name (not all, *, or a group).
+      if (!targetsMeByName(target, channel!.name)) return;
+      receivedAddressed.add(m.seq);
+      if (profile().receipts) reactions?.enqueue(m.seq, RECEIVED);
+    };
     for (const m of incoming) {
+      // Receipts are bookkeeping (learn() recorded them): they never wake anyone and aren't shown as context.
+      if (isReceiptReaction(m.text)) continue;
+      const im = parseInterrupt(m.text);
+      if (im && stopTargetsMe(im.target, channel.name, profile().groups)) {
+        if (stopAllowed(m.from)) {
+          receipt(m, im.target);
+          if (inbox.interrupts.tryInterrupt(m.from)) {
+            interrupted = true;
+            urgent++;
+            void handleInterrupt(m, im.message);
+          } else {
+            // Over this sender's limit: an ordinary addressed message (no abort, normal budget and wake policy).
+            downgraded.push(m);
+            void bgPost(ackText("⛔", channel.name, "is treating it as a normal message — interrupt limit reached", m));
+          }
+          continue;
+        }
+        // Same as a disallowed /stop: say so, record it as an ordinary message, keep pending wakes.
+        void bgPost(ackText("⛔", channel.name, "is ignoring it — that sender is not allowed to interrupt", m));
+      }
       const sm = parseStop(m.text);
       if (sm && stopTargetsMe(sm.target, channel.name, profile().groups)) {
         if (stopAllowed(m.from)) {
@@ -251,14 +561,19 @@ export default function mayflyExtension(pi: ExtensionAPI) {
         }
         // Not allowed: say so, and treat it as an ordinary (recorded, non-waking) message. It must not
         // cancel a pending wake.
-        void channel.post(`⛔ ignoring /stop from "${m.from || "?"}" — not allowed to stop ${channel.name}`, { replyTo: m.seq }).catch(() => {});
+        void bgPost(ackText("⛔", channel.name, "is ignoring it — that sender is not allowed to stop", m));
       }
       rest.push(m);
     }
-    const want = inbox.add(rest);
-    // Don't start new work right after a stop; what arrived stays buffered for the next wake.
-    if (stopped) clearTimer();
-    else if (want) schedule(COALESCE_MS);
+    ackReceived(rest);
+    // Only a batch that brings something new and waking asks for a wake (receipts alone never do).
+    let want = inbox.add(rest);
+    if (downgraded.length) want = inbox.addAddressed(downgraded) || want;
+    if (stopped) {
+      // Don't start new work after a stop: what is buffered is held for the next genuinely new wake.
+      clearTimer();
+      inbox.hold();
+    } else if (want && !interrupted) schedule(COALESCE_MS); // after an /interrupt, its urgent wake takes what is buffered
     if (reconnecting) {
       reconnecting = false;
       if (reconnectTimer) clearTimeout(reconnectTimer);
@@ -310,6 +625,14 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     clearTimer();
     watcher?.abort();
     channel?.close();
+    bgAbort.abort();
+    bgAbort = new AbortController();
+    reactions?.close();
+    reactions = null;
+    // Pending mayfly_post waitFor calls end now (not satisfied), and their timers are cleared.
+    receipts.cancelWaits("left the channel");
+    inflight.clear();
+    inflightOverflow = 0;
     watcher = null;
     channel = null;
     inbox = null;
@@ -354,10 +677,22 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     channel = ch;
     config = normalizeSaved(cfg);
     inbox = new Inbox(config.profile!, { name: ch.name, ownSeqs: ch.ownSeqs });
+    receipts = new ReceiptTracker(200);
+    participants.clear();
+    knownGroups.clear();
+    authors.clear();
+    receivedAddressed.clear();
+    // Done only once posted (or possibly posted: an uncertain result is never retried, so no receipt is doubled).
+    reactions = new ReactionQueue(async (seq, emoji) => (await bgPost("", undefined, { seq, emoji }))?.posted ?? false);
     // Only resume from a cursor saved for this channel (legacy cursors have no id).
     const since = cursor && (cursor.id === undefined || cursor.id === ch.id) ? cursor.last : undefined;
     // Learn which recent messages are ours so `/re N` to them wakes us after a restart (best effort).
-    const hist = ch.history(100).catch(() => {});
+    const hist = ch
+      .history(100)
+      .then((msgs) => {
+        if (channel === ch) learn(msgs);
+      })
+      .catch(() => {});
     if (since === undefined) startWatch();
     else {
       // Resuming: hold the backlog until history has filled ownSeqs (bounded), so a `/re` to one of our
@@ -374,7 +709,7 @@ export default function mayflyExtension(pi: ExtensionAPI) {
       // resumed session can rejoin automatically.
       pi.appendEntry<JoinConfig>("mayfly-join", config);
       // Introduce ourselves on an explicit join (not on silent auto-rejoin after a restart).
-      void ch.post(introMessage(ch.name, config.profile!, config.task)).catch(() => {});
+      void bgPost(introMessage(ch.name, config.profile!, config.task));
     }
     const summary = `Watching ${ch.redactedUrl} as "${ch.name}" (wake: ${config.profile!.wake}${config.profile!.groups.length ? `, groups: ${config.profile!.groups.join(", ")}` : ""}).`;
     if (ctx.hasUI) ctx.ui.notify(`Mayfly: ${summary}`, "info");
@@ -409,8 +744,38 @@ export default function mayflyExtension(pi: ExtensionAPI) {
       `task: ${config?.task ?? "(not stated)"}`,
       `wake: ${p.wake}; groups: ${p.groups.length ? p.groups.map((g) => "@" + g).join(" ") : "(none)"}; bare-name mentions: ${p.requireAtForMention ? "off" : "on"}`,
       `budget: ${budget}`,
-      `unseen: ${inbox.unseenCount} (${inbox.pending.length} addressed); cursor #${channel.last}; remote stop: ${allow}`,
+      `unseen: ${inbox.unseenCount} (${inbox.pending.length} addressed); cursor #${channel.last}; remote stop/interrupt: ${allow}`,
+      `receipts: ${p.receipts ? "on" : "off"} (for direct @name/reply addressing); busy notice: ${p.busyNoticeAfterSec === false ? "off" : `after ${p.busyNoticeAfterSec}s`}; interrupts: ${p.budget.interruptsPerHour}/hour per sender`,
+      ...(inbox.hasHeld ? ["held: messages from an aborted or stopped run wait for the next wake, your next prompt, mayfly_resume, or mayfly_read unread"] : []),
+      ...(inflightOverflow ? [`warning: ${inflightOverflow} injected wake(s) were dropped from tracking unconfirmed`] : []),
+      ...awaitingReceipts(),
     ].join("\n");
+  }
+
+  /** Our recent addressed messages still missing 📬 or 👀. */
+  function awaitingReceipts(): string[] {
+    const miss = receipts.missing(10);
+    if (!miss.length) return [];
+    const now = Date.now();
+    return [
+      "awaiting receipts:",
+      ...miss.map(({ rec, noReceived, noSeen }) => {
+        const gaps = [noReceived.length ? `no ${RECEIVED} from ${noReceived.join(", ")}` : "", noSeen.length ? `no ${SEEN} from ${noSeen.join(", ")}` : ""];
+        return `  #${rec.seq} (${formatDuration(now - rec.postedAt)} ago) ${gaps.filter(Boolean).join("; ")}${rec.text ? ` — "${rec.text}"` : ""}`;
+      }),
+    ];
+  }
+
+  function receiptsReport(seq?: number): string {
+    if (!channel) return "Not in a Mayfly channel.";
+    if (seq !== undefined) {
+      const rec = receipts.get(seq);
+      if (!rec) return channel.ownSeqs.has(seq) ? `#${seq}: no receipts recorded.` : `#${seq} is not one of your recent messages.`;
+      return `#${seq}${rec.text ? ` "${rec.text}"` : ""}: ${describeReceipts(rec)}`;
+    }
+    const recs = receipts.recent(10).filter((r) => r.text || r.received.size);
+    if (!recs.length) return "No receipts tracked yet (post with mayfly_post first).";
+    return recs.map((r) => `#${r.seq}${r.text ? ` "${r.text}"` : ""}: ${describeReceipts(r)}`).join("\n");
   }
 
   function setWake(policy: WakePolicy, groups?: string[]): string {
@@ -429,7 +794,8 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     if (!inbox) return "Not in a Mayfly channel.";
     const was = inbox.budget.isPaused;
     inbox.resume();
-    if (inbox.wantsWake()) schedule(COALESCE_MS);
+    // Held messages (after an abort or /stop) are delivered now too.
+    if (inbox.release()) schedule(COALESCE_MS);
     refreshStatus();
     return was ? "Auto-wake resumed; the wake budget was reset." : "Auto-wake was not paused; the wake budget was reset.";
   }
@@ -440,7 +806,7 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     if (!t) throw new Error("task must be nonblank");
     config = { ...config, task: t };
     pi.appendEntry("mayfly-task", { task: t });
-    const r = await channel.post(taskUpdateMessage(channel.name, t));
+    const r = (await bgPost(taskUpdateMessage(channel.name, t))) ?? { posted: null, error: "not posted", newMessages: [] };
     return r.posted === true ? `Task updated and announced (#${r.id}).` : `Task updated locally; the announcement was not posted (${r.error ?? (r.conflict ? "conflict" : "unknown")}).`;
   }
 
@@ -487,6 +853,54 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     }
   });
 
+  // --- runtime events: busy state and 👀 receipts ------------------------------
+  pi.on("tool_execution_start", async (event) => {
+    if (!event?.parentToolCallId && event?.toolCallId) busy.toolStart(event.toolCallId, event.toolName ?? "tool");
+  });
+  pi.on("tool_execution_end", async (event) => {
+    if (event?.toolCallId) busy.toolEnd(event.toolCallId);
+  });
+  pi.on("message_start", async (event) => {
+    // Our injected wake entered the model's context: react 👀 to the addressed messages it carried.
+    const msg = event?.message as { role?: string; customType?: string; details?: any } | undefined;
+    if (msg?.role !== "custom" || msg.customType !== "mayfly") return;
+    const d = msg.details;
+    if (typeof d?.id === "string") inflight.delete(d.id);
+    // If these messages were also put back into the inbox (a steer we thought lost, which Pi kept), drop them.
+    if (Array.isArray(d?.seqs)) inbox?.forgetSeqs(d.seqs.filter((s: unknown) => typeof s === "number"));
+    if (Array.isArray(d?.addressed)) markSeenSeqs(d.addressed.filter((s: unknown) => typeof s === "number"));
+  });
+  pi.on("agent_end", async (_event, ctx) => {
+    busy.runEnd();
+    // A wake steered in during a run that was then aborted (Esc, /stop, /interrupt, any ctx.abort()) can be
+    // dropped. If one sent before this run ended still hasn't reached the model shortly after, put its messages
+    // back into the inbox, HELD: an aborted run never restarts by itself. They come with the next addressed
+    // wake, the user's next prompt, mayfly_resume, or mayfly_read unread.
+    const endedAt = Date.now();
+    lastAgentEndAt = endedAt;
+    const ch = channel;
+    const t = setTimeout(() => {
+      if (channel !== ch || !inbox || !ctx.isIdle()) return;
+      if (requeueInflight((sentAt) => sentAt <= endedAt)) refreshStatus();
+    }, LOST_INJECTION_MS);
+    t.unref?.();
+  });
+  pi.on("before_agent_start", async (event) => {
+    // A run the user started: bring held messages along (as context for this run; no wake budget spent).
+    const e = event as { messageType?: string; prompt?: unknown };
+    const userRun = e?.messageType === "user" || (e?.messageType === undefined && typeof e?.prompt === "string");
+    if (!userRun || !channel || !inbox) return;
+    // Injections from an earlier, finished run that never reached the model are lost: hold them first.
+    requeueInflight((sentAt) => sentAt <= lastAgentEndAt);
+    const a = inbox.takeHeld(header(), ["(Held after your previous run was aborted or stopped; delivered with this prompt.)"]);
+    if (!a) return;
+    const id = `${Date.now().toString(36)}-${++injectCount}`;
+    inflight.set(id, { taken: a.taken, sentAt: Date.now() });
+    inflightOverflow += bound(inflight, INFLIGHT_MAX);
+    refreshStatus();
+    return { message: { customType: "mayfly", content: a.content, display: true, details: { id, seqs: a.seqs, addressed: a.addressedSeqs } } };
+  });
+
   pi.on("session_shutdown", async () => {
     teardown(); // also clears the footer status
     sessionCtx = null;
@@ -499,11 +913,13 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     "/mayfly wake <addressed|all|none> [groups]",
     "/mayfly task <what you're working on>   (announce a new task)",
     "/mayfly open   (open the chat in your browser)",
+    "/mayfly receipts [seq]   (delivery receipts for your messages)",
     "/mayfly resume | leave | status",
   ].join("\n");
 
   pi.registerCommand("mayfly", {
-    description: "Mayfly chat: join <url> [name] [--…] [-- task] | new [origin] [name] [-- task] | task <text> | open | wake <policy> | resume | leave | status",
+    description:
+      "Mayfly chat: join <url> [name] [--…] [-- task] | new [origin] [name] [-- task] | task <text> | open | wake <policy> | receipts [seq] | resume | leave | status",
     handler: async (rawArgs, ctx) => {
       sessionCtx = ctx;
       const { args, task: taskArg } = splitTaskArg(rawArgs);
@@ -560,6 +976,10 @@ export default function mayflyExtension(pi: ExtensionAPI) {
           const t = rawArgs.trim().replace(/^task\s*/i, "").replace(/^--\s*/, "");
           if (!t) return ctx.ui.notify(`Mayfly: task: ${config?.task ?? "(not stated)"}. Usage: /mayfly task <what you're working on>`, "info");
           return ctx.ui.notify(`Mayfly: ${await setTask(t)}`, "info");
+        }
+        if (sub === "receipts") {
+          const n = tokens[0] ? Number(tokens[0].replace(/^#/, "")) : undefined;
+          return ctx.ui.notify(`Mayfly: ${receiptsReport(n !== undefined && Number.isInteger(n) ? n : undefined)}`, "info");
         }
         if (sub === "open") return ctx.ui.notify(`Mayfly: ${openChat()}`, "info");
         if (sub === "resume") return ctx.ui.notify(`Mayfly: ${resume()}`, "info");
@@ -671,7 +1091,8 @@ export default function mayflyExtension(pi: ExtensionAPI) {
       label: "Mayfly Status",
       promptSnippet: "mayfly_status — show the Mayfly connection, wake policy, and budget.",
       description:
-        "Show the Mayfly connection: channel (without key), your name, wake policy, groups, wake budget, unseen count, and cursor.",
+        "Show the Mayfly connection: channel (without key), your name, wake policy, groups, wake budget, unseen count, " +
+        "cursor, and your recent addressed messages still missing a 📬 (received) or 👀 (seen) receipt.",
       parameters: Type.Object({}),
       async execute() {
         return text(status());
@@ -747,7 +1168,11 @@ export default function mayflyExtension(pi: ExtensionAPI) {
         "Post a message to the connected Mayfly chat channel. Optionally reply to a message by its #seq. To address " +
         "someone (and wake them), include @theirName; @all addresses everyone. Don't @-mention agents needlessly: it " +
         "wakes them. If another participant posted first (a conflict), the post is NOT sent and the missed messages " +
-        "are returned so you can reconsider before trying again.",
+        "are returned so you can reconsider before trying again. Recipients' extensions react 📬 when they receive a " +
+        "message addressed to them directly (@theirName, or a reply to their message) and 👀 when it reaches their " +
+        "model; @all and @group messages get no receipts. waitFor=\"received\" or \"seen\" blocks until the directly " +
+        "addressed recipient(s) react at that level (or timeoutSec passes) and reports the receipts; it returns at " +
+        "once if nobody is addressed by name. Use it only when you need to know before continuing.",
       promptSnippet: "mayfly_post — send a message to the Mayfly chat.",
       promptGuidelines: [
         "Mayfly chat: you are only woken when addressed (@yourName, a /re reply to your message, @all, @group). Reply only when it adds something, and @-mention another agent only when you need it to act, since that wakes it.",
@@ -755,17 +1180,49 @@ export default function mayflyExtension(pi: ExtensionAPI) {
       parameters: Type.Object({
         text: Type.String({ description: "Message text to post." }),
         replyTo: Type.Optional(Type.Number({ description: "Optional #seq of a message to reply to." })),
+        waitFor: Type.Optional(
+          StringEnum(["received", "seen"] as const, "Wait until the @name/reply addressee(s) react 📬 (received) or 👀 (seen, i.e. in their model's context)."),
+        ),
+        timeoutSec: Type.Optional(Type.Number({ description: `With waitFor: max seconds to wait (default ${WAIT_DEFAULT_SEC}, max ${WAIT_MAX_SEC}).` })),
       }),
-      async execute(_id, params) {
+      async execute(_id, params, signal) {
         if (!channel) return notJoined;
-        const res = await channel.post(params.text, { replyTo: params.replyTo });
+        const ch = channel;
+        const postedAt = Date.now();
+        const res = await toolPost(params.text, { replyTo: params.replyTo });
         const parts: string[] = [];
-        if (res.posted === true) parts.push(`Posted as #${res.id}.`);
-        else if (res.conflict) parts.push("Conflict: someone posted first — your message was NOT sent. Reconsider, then post again.");
+        let targets: ReturnType<typeof resolveTargets> = null;
+        if (res.posted === true && typeof res.id === "number") {
+          targets = resolveTargets(
+            params.text,
+            participants,
+            ch.name,
+            params.replyTo !== undefined ? authors.get(params.replyTo) : undefined,
+            [...knownGroups, ...profile().groups],
+          );
+          receipts.noteOwn(res.id, params.text, targets, postedAt);
+        }
+        const shown = shownOthers(res);
+        observeShown(res.newMessages);
+        if (res.posted === true && typeof res.id === "number" && params.waitFor) {
+          const level: ReceiptLevel = params.waitFor;
+          const none = noReceiptsExpected(targets);
+          if (none) parts.push(`Posted #${res.id}. Not waiting: ${none}.`);
+          else {
+            const sec = Math.min(WAIT_MAX_SEC, Math.max(1, Math.round(params.timeoutSec ?? WAIT_DEFAULT_SEC)));
+            const w = await receipts.wait(res.id, level, sec * 1000, signal);
+            const ended = w.aborted || w.cancelled;
+            parts.push(
+              `Posted #${res.id}. ${describeReceipts(w.record, { level, waitedSec: ended ? undefined : sec })}` +
+                (w.cancelled ? ` (wait cancelled: ${w.cancelled})` : w.aborted ? " (wait cancelled)" : ""),
+            );
+          }
+        } else if (res.posted === true) parts.push(`Posted as #${res.id}.`);
+        else if (res.conflict) parts.push(conflictLine(shown, "message"));
         else if (res.posted === null) parts.push(`Uncertain: ${res.error ?? "network error"}. Use mayfly_read before reposting.`);
         else parts.push(`Not posted: ${res.error ?? "refused"}.`);
-        if (res.newMessages.length) {
-          parts.push("\nMessages from others:\n" + formatMessages(res.newMessages));
+        if (shown.length) {
+          parts.push("\nMessages from others:\n" + formatMessages(shown));
         }
         return {
           content: [{ type: "text" as const, text: parts.join("\n") }],
@@ -794,15 +1251,74 @@ export default function mayflyExtension(pi: ExtensionAPI) {
         const target = params.target.trim().replace(/^@/, "");
         if (!target || target.includes('"')) return text('target must be a chat name without double quotes, a group, or "all".', true);
         // A name with spaces is sent quoted: /stop "Pi Bot" reason.
-        const res = await channel.post(`/stop ${/\s/.test(target) ? `"${target}"` : target}${params.reason ? ` ${params.reason}` : ""}`);
+        const res = await toolPost(`/stop ${quoteTarget(target)}${params.reason ? ` ${params.reason}` : ""}`);
+        const shown = shownOthers(res);
+        observeShown(res.newMessages);
         const msg =
           res.posted === true
-            ? `Stop request sent to ${target} as #${res.id}. It will acknowledge with a ⏹ message.`
+            ? `Stop request sent to ${target} as #${res.id}. It will acknowledge with a ⏹ message (non-waking); see mayfly_receipts ${res.id}.`
             : res.conflict
-              ? "Conflict: new messages arrived first; stop NOT sent. Review them and retry if still needed."
+              ? conflictLine(shown, "stop request")
               : `Stop request not sent: ${res.error ?? "error"}.`;
-        const extra = res.newMessages.length ? "\n\nMessages from others:\n" + formatMessages(res.newMessages) : "";
+        const extra = shown.length ? "\n\nMessages from others:\n" + formatMessages(shown) : "";
         return { content: [{ type: "text" as const, text: msg + extra }], details: { posted: res.posted, id: res.id }, isError: res.posted !== true };
+      },
+    }),
+  );
+
+  pi.registerTool(
+    defineTool({
+      name: "mayfly_interrupt",
+      label: "Mayfly Interrupt",
+      description:
+        "URGENT ONLY. Interrupt another agent in the Mayfly channel: it ABORTS whatever it is running right now " +
+        "(its current turn and any shell commands), then handles your message immediately and decides whether to " +
+        "resume. Sends `/interrupt <name> <message>`; the target's extension handles it. Use only when waiting for " +
+        "the agent to finish its current step would cause real harm or waste (e.g. it is working from wrong " +
+        "information, or the user asked to break in). For ordinary requests use mayfly_post with @name (it is read " +
+        "after the current step); to stop an agent without new work use mayfly_stop. Target \"all\" or a group tag " +
+        "interrupts every matching agent. Each recipient accepts a few urgent interrupts per sender per hour (default 6); " +
+        "beyond that it treats yours as an ordinary addressed message and says so with a ⛔ notice.",
+      parameters: Type.Object({
+        target: Type.String({ description: 'Chat name of the agent to interrupt (may contain spaces), a group tag, or "all".' }),
+        message: Type.String({ description: "What the agent should do or know right now." }),
+      }),
+      async execute(_id, params) {
+        if (!channel) return notJoined;
+        const target = params.target.trim().replace(/^@/, "");
+        if (!target || target.includes('"')) return text('target must be a chat name without double quotes, a group, or "all".', true);
+        const message = params.message.trim();
+        if (!message) return text("message must be nonblank.", true);
+        const res = await toolPost(`/interrupt ${quoteTarget(target)} ${message}`);
+        const shown = shownOthers(res);
+        observeShown(res.newMessages);
+        if (res.posted === true && typeof res.id === "number") receipts.noteOwn(res.id, `/interrupt ${target} ${message}`, null);
+        const msg =
+          res.posted === true
+            ? `Interrupt sent to ${target} as #${res.id}. It will acknowledge with a ⚡ message (or ⛔ if not allowed), which does not wake you; see mayfly_receipts ${res.id}.`
+            : res.conflict
+              ? conflictLine(shown, "interrupt")
+              : `Interrupt not sent: ${res.error ?? "error"}.`;
+        const extra = shown.length ? "\n\nMessages from others:\n" + formatMessages(shown) : "";
+        return { content: [{ type: "text" as const, text: msg + extra }], details: { posted: res.posted, id: res.id }, isError: res.posted !== true };
+      },
+    }),
+  );
+
+  pi.registerTool(
+    defineTool({
+      name: "mayfly_receipts",
+      label: "Mayfly Receipts",
+      description:
+        "Delivery receipts for your Mayfly messages: who reacted 📬 (their extension received it) and 👀 (it reached " +
+        "their model), with delays, plus any busy notices. No 📬 after a while usually means the recipient isn't " +
+        "running (or has receipts off); 📬 without 👀 means it is queued behind the recipient's current work.",
+      parameters: Type.Object({
+        seq: Type.Optional(Type.Number({ description: "One of your message #seqs; omit for your recent messages." })),
+      }),
+      async execute(_id, params) {
+        if (!channel) return notJoined;
+        return text(receiptsReport(params.seq));
       },
     }),
   );
@@ -819,6 +1335,7 @@ export default function mayflyExtension(pi: ExtensionAPI) {
       async execute(_id, params) {
         if (!channel) return notJoined;
         const res = await channel.react(params.seq, params.emoji);
+        if (res.newMessages.length) deliver(res.newMessages); // not shown to the model: deliver as usual
         return text(
           res.posted === true ? `Reacted ${params.emoji} to #${params.seq}.` : `Reaction not sent: ${res.conflict ? "conflict, retry" : (res.error ?? "error")}.`,
           res.posted !== true,
@@ -845,11 +1362,14 @@ export default function mayflyExtension(pi: ExtensionAPI) {
         if (!channel || !inbox) return notJoined;
         if (params.unread) {
           if (!inbox.unseenCount) return text("(no unseen messages)");
-          const out = inbox.take(header(), [], "Use mayfly_read with count to see older history.").content;
+          const out = inbox.take(header(), [], "Use mayfly_read with count to see older history.");
+          markSeenSeqs(out.addressedSeqs);
           refreshStatus();
-          return text(out);
+          return text(out.content);
         }
         const msgs = await channel.history(Math.min(500, params.count ?? 20));
+        learn(msgs);
+        markSeenSeqs(msgs.map((m) => m.seq));
         if (msgs.length) inbox.markSeen(msgs[0].seq, msgs[msgs.length - 1].seq);
         refreshStatus();
         return text(msgs.length ? formatMessages(msgs) : "(no messages yet)", false, { count: msgs.length });

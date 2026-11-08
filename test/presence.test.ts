@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { browserCommand, introMessage, osc8, reachability, splitTaskArg, statusLabel, taskUpdateMessage } from "../presence.ts";
+import { browserCommand, introMessage, osc8, parseIntro, reachability, splitTaskArg, statusLabel, taskUpdateMessage } from "../presence.ts";
 import { mergeProfile } from "../profile.ts";
 
 test("introMessage: name, task, and how to reach the agent", () => {
@@ -50,4 +50,10 @@ test("browserCommand per platform", () => {
   assert.deepEqual(browserCommand("u", "darwin"), { cmd: "open", args: ["u"] });
   assert.deepEqual(browserCommand("u", "linux"), { cmd: "xdg-open", args: ["u"] });
   assert.deepEqual(browserCommand("u", "win32"), { cmd: "cmd", args: ["/c", "start", "", "u"] });
+});
+
+test("parseIntro round-trips introMessage and learns groups", () => {
+  assert.deepEqual(parseIntro(introMessage("PiLive", mergeProfile({ groups: ["reviewers", "ops"] }), "x")), { name: "PiLive", groups: ["reviewers", "ops"] });
+  assert.deepEqual(parseIntro(introMessage("A", mergeProfile())), { name: "A", groups: [] });
+  assert.equal(parseIntro("hello"), null);
 });

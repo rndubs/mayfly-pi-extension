@@ -32,20 +32,35 @@ export interface Profile {
     hourlyCap: number;
     /** After a pause, resume once this many minutes pass with no addressed messages. */
     quietResumeMinutes: number;
+    /**
+     * Urgent /interrupts accepted per sender per rolling hour (default 6). Within it an interrupt aborts the running
+     * work and wakes at once, bypassing the throttle and a pause. Above it, the interrupt is handled as an ordinary
+     * addressed message (no abort; normal budget and wake policy).
+     */
+    interruptsPerHour: number;
   };
-  /** Who may `/stop` this agent: anyone in the channel, nobody, or these sender names. */
+  /** Who may `/stop` or `/interrupt` this agent: anyone in the channel, nobody, or these sender names. */
   allowStop: AllowStop;
   /** true (default): only `@name` counts as a mention. false: the bare word `name` does too. */
   requireAtForMention: boolean;
+  /** true (default): react 📬 when an addressed message is received and 👀 when it reaches the model. */
+  receipts: boolean;
+  /**
+   * Post a one-time "⏳ busy" notice when an addressed message arrives while one tool call has been running
+   * longer than this many seconds (default 30). false disables the notice.
+   */
+  busyNoticeAfterSec: number | false;
 }
 
 export const DEFAULT_PROFILE: Profile = Object.freeze({
   groups: [],
   wake: "addressed",
   context: { recentK: 10, maxBytes: 16 * 1024 },
-  budget: { burst: 6, refillPerMinute: 1, hourlyCap: 30, quietResumeMinutes: 10 },
+  budget: { burst: 6, refillPerMinute: 1, hourlyCap: 30, quietResumeMinutes: 10, interruptsPerHour: 6 },
   allowStop: "anyone",
   requireAtForMention: true,
+  receipts: true,
+  busyNoticeAfterSec: 30,
 }) as Profile;
 
 /** Deep-partial profile, as found in a file or built from flags. */
@@ -57,6 +72,8 @@ export interface ProfileInput {
   budget?: Partial<Profile["budget"]>;
   allowStop?: AllowStop;
   requireAtForMention?: boolean;
+  receipts?: boolean;
+  busyNoticeAfterSec?: number | false;
 }
 
 export const WAKE_POLICIES: readonly WakePolicy[] = ["addressed", "all", "none"];
@@ -68,7 +85,7 @@ export function validateProfile(raw: unknown, source = "profile"): ProfileInput 
   const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
   if (!isObj(raw)) throw new Error(`${source}: expected a JSON object`);
   const out: ProfileInput = {};
-  const known = new Set(["name", "groups", "wake", "context", "budget", "allowStop", "requireAtForMention", "description", "$schema"]);
+  const known = new Set(["name", "groups", "wake", "context", "budget", "allowStop", "requireAtForMention", "receipts", "busyNoticeAfterSec", "description", "$schema"]);
   for (const k of Object.keys(raw)) if (!known.has(k)) errs.push(`unknown key "${k}"`);
 
   if (raw.name !== undefined) {
@@ -109,6 +126,7 @@ export function validateProfile(raw: unknown, source = "profile"): ProfileInput 
     refillPerMinute: { min: 0, int: false },
     hourlyCap: { min: 1, int: true },
     quietResumeMinutes: { min: 0, int: false },
+    interruptsPerHour: { min: 0, int: true },
   });
   if (raw.allowStop !== undefined) {
     const a = raw.allowStop;
@@ -119,6 +137,15 @@ export function validateProfile(raw: unknown, source = "profile"): ProfileInput 
   if (raw.requireAtForMention !== undefined) {
     if (typeof raw.requireAtForMention !== "boolean") errs.push("requireAtForMention: must be true or false");
     else out.requireAtForMention = raw.requireAtForMention;
+  }
+  if (raw.receipts !== undefined) {
+    if (typeof raw.receipts !== "boolean") errs.push("receipts: must be true or false");
+    else out.receipts = raw.receipts;
+  }
+  if (raw.busyNoticeAfterSec !== undefined) {
+    const v = raw.busyNoticeAfterSec;
+    if (v === false || (typeof v === "number" && Number.isFinite(v) && v >= 0)) out.busyNoticeAfterSec = v;
+    else errs.push("busyNoticeAfterSec: must be a number of seconds >= 0, or false to disable");
   }
   if (errs.length) throw new Error(`${source}: ${errs.join("; ")}`);
   return out;
@@ -139,6 +166,8 @@ export function mergeProfile(...layers: (ProfileInput | undefined)[]): Profile {
     if (l.wake !== undefined) p.wake = l.wake;
     if (l.allowStop !== undefined) p.allowStop = Array.isArray(l.allowStop) ? [...l.allowStop] : l.allowStop;
     if (l.requireAtForMention !== undefined) p.requireAtForMention = l.requireAtForMention;
+    if (l.receipts !== undefined) p.receipts = l.receipts;
+    if (l.busyNoticeAfterSec !== undefined) p.busyNoticeAfterSec = l.busyNoticeAfterSec;
     if (l.context) Object.assign(p.context, stripUndefined(l.context));
     if (l.budget) Object.assign(p.budget, stripUndefined(l.budget));
   }

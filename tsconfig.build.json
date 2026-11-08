@@ -2,11 +2,12 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": false,
-    "allowImportingTsExtensions": false,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
     "outDir": "dist",
     "rootDir": ".",
     "declaration": true,
     "sourceMap": false
   },
-  "include": ["index.ts", "mayfly-core.ts", "policy.ts", "profile.ts", "presence.ts"]
+  "include": ["index.ts", "mayfly-core.ts", "policy.ts", "profile.ts", "presence.ts", "receipts.ts"]
 }
