@@ -23,9 +23,27 @@ export function isReceiptReaction(text: string): boolean {
   return !!r && (r.emoji === RECEIVED || r.emoji === SEEN);
 }
 
-/** Receipts and busy notices: automatic chatter that must never wake anyone (even under wake=all). */
+/** Receipts, busy notices and ⏹/⚡/⛔ acks: automatic chatter that must never wake anyone (even under wake=all). */
 export function isReceiptChatter(text: string): boolean {
-  return isReceiptReaction(text) || parseBusyNotice(text) !== null;
+  return isReceiptReaction(text) || parseBusyNotice(text) !== null || parseAck(text) !== null;
+}
+
+// --- ⏹ / ⚡ / ⛔ acks ------------------------------------------------------------
+
+export type AckKind = "⏹" | "⚡" | "⛔";
+
+/**
+ * A non-waking acknowledgement of a /stop or /interrupt: plain names and `#seq`, no `/re` and no `@`, so it
+ * addresses nobody. E.g. `⚡ B interrupted (was running bash, 6m) — handling it (#41 from A)`.
+ */
+export function ackText(kind: AckKind, me: string, what: string, m: { seq: number; from: string }): string {
+  const from = (m.from || "?").replace(/@/g, "");
+  return `${kind} ${me} ${what} (#${m.seq} from ${from})`;
+}
+
+export function parseAck(text: string): { kind: AckKind; name: string; seq: number; from: string } | null {
+  const m = /^(⏹|⚡|⛔) (.+?) .*\(#(\d+) from ([^)]*)\)$/su.exec(text);
+  return m ? { kind: m[1] as AckKind, name: m[2], seq: Number(m[3]), from: m[4] } : null;
 }
 
 // --- busy notice ---------------------------------------------------------------
@@ -182,10 +200,16 @@ export class ReactionQueue {
 
 // --- receipt tracking (sender side) -------------------------------------------------
 
-/** Who a message of ours is addressed to. `anyone`: @all or a group (any reactor counts). */
+/**
+ * Who a message of ours is addressed to. `names`: exact participants whose receipts we wait for (including
+ * @names we haven't seen post yet, listed again in `unseen`). `anyone`: @all or a known group, where a receipt
+ * from anyone counts (`groups` lists the groups, for the summary).
+ */
 export interface Targets {
   names: string[];
   anyone: boolean;
+  groups?: string[];
+  unseen?: string[];
 }
 
 const NAME_CH = "\\p{L}\\p{N}_\\-";
@@ -193,10 +217,17 @@ const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 /**
  * Parse whom `text` addresses: known participant names mentioned with @ (longest first, so "Pi Bot" wins over
- * "Pi"), plus the author of the message it replies to. @all, or any other @tag (a group, or a name we haven't
- * seen yet), means anyone. Returns null if it addresses nobody.
+ * "Pi"), plus the author of the message it replies to. `@all`, or an @tag that is a known group (learned from join
+ * intros), means anyone. Any other @tag is taken as the exact name of someone who hasn't posted yet: we wait for
+ * that name, not for anyone. Returns null if it addresses nobody.
  */
-export function resolveTargets(text: string, known: Iterable<string>, me: string, replyToAuthor?: string): Targets | null {
+export function resolveTargets(
+  text: string,
+  known: Iterable<string>,
+  me: string,
+  replyToAuthor?: string,
+  knownGroups: Iterable<string> = [],
+): Targets | null {
   const names: string[] = [];
   const add = (n: string) => {
     if (n.toLowerCase() !== me.toLowerCase() && !names.some((x) => x.toLowerCase() === n.toLowerCase())) names.push(n);
@@ -211,10 +242,26 @@ export function resolveTargets(text: string, known: Iterable<string>, me: string
     }
   }
   let anyone = false;
-  const tagRe = new RegExp(`(?<![${NAME_CH}@.])@([${NAME_CH}]+)(?![@])`, "gu");
-  for (const m of rest.matchAll(tagRe)) if (m[1].toLowerCase() !== me.toLowerCase()) anyone = true;
+  const groups: string[] = [];
+  const unseen: string[] = [];
+  const groupSet = new Set([...knownGroups].map((g) => g.toLowerCase()));
+  const tagRe = new RegExp(`(?<![${NAME_CH}@.])@([${NAME_CH}]+)(?![@])(?!\\.[${NAME_CH}])`, "gu");
+  for (const m of rest.matchAll(tagRe)) {
+    const tag = m[1];
+    const lc = tag.toLowerCase();
+    if (lc === me.toLowerCase()) continue;
+    if (lc === "all") anyone = true;
+    else if (groupSet.has(lc)) {
+      anyone = true;
+      if (!groups.some((g) => g.toLowerCase() === lc)) groups.push(tag);
+    } else if (!names.some((x) => x.toLowerCase() === lc)) {
+      add(tag);
+      unseen.push(tag);
+    }
+  }
   if (replyToAuthor) add(replyToAuthor);
-  return names.length || anyone ? { names, anyone } : null;
+  if (!names.length && !anyone) return null;
+  return { names, anyone, ...(groups.length ? { groups } : {}), ...(unseen.length ? { unseen } : {}) };
 }
 
 export interface OwnRecord {
@@ -408,6 +455,10 @@ export function describeReceipts(rec: OwnRecord, opts: { level?: ReceiptLevel; w
       if (noSeen.length) parts.push(`no ${SEEN}${names && names.length > 1 ? ` from ${noSeen.join(", ")}` : ""}${within}`);
     }
   }
+  // Say which rule decided "who counts", so the model can interpret a missing receipt.
+  const t = rec.targets;
+  if (t?.unseen?.length) parts.push(`waiting for exact name${t.unseen.length > 1 ? "s" : ""} ${t.unseen.join(", ")} (not seen in this channel yet)`);
+  if (t?.anyone && !t.names.length) parts.push(t.groups?.length ? `any member of ${t.groups.map((g) => "@" + g).join(", ")} counts` : "anyone counts (@all)");
   const seenBusy = new Set<string>();
   for (const b of [...rec.busy].reverse()) {
     if (seenBusy.has(b.name.toLowerCase())) continue;

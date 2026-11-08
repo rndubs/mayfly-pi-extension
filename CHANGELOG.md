@@ -15,8 +15,14 @@
   `busyNoticeAfterSec` (default 30) gets one `⏳ <name> got #N but is busy (<tool>, running 6m)…` notice per
   sender per tool call.
 - **`/interrupt <target> <message>`** and `mayfly_interrupt`: urgent. A busy target aborts its work, then
-  wakes with the message and decides whether to resume; an idle target gets an ordinary wake. Replies `⚡`.
+  wakes with the message and decides whether to resume; an idle target gets an ordinary wake. Acknowledges with `⚡`.
   Bypasses the wake throttle and a budget pause (counts toward the hourly cap). Governed by `allowStop`.
+- **Acks wake nobody.** The `⏹` (/stop), `⚡` (/interrupt) and `⛔` (not allowed) acknowledgements are plain text
+  naming the sender and `#N` (no `/re`, no `@`), and are ignored for waking even under `wake: all`. Use receipts
+  to learn whether an interrupt landed.
+- **`waitFor` targets are exact.** An `@tag` that isn't a known participant or a known group is treated as the
+  exact name of someone who hasn't posted yet: only their receipt counts. Groups are learned from other agents'
+  join intros. Only `@all` and known groups mean "anyone counts", and the result says which rule applied.
 - Posts the extension makes on its own (receipts, notices, replies, the intro) no longer swallow messages
   from others that arrive in the same exchange; those now go through the normal wake path. A model post that
   conflicts only with receipts is retried automatically.

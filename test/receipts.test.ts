@@ -14,6 +14,8 @@ import {
   ReactionQueue,
   ReceiptTracker,
   resolveTargets,
+  ackText,
+  parseAck,
 } from "../receipts.ts";
 
 const msg = (from: string, text: string, seq = 1) => ({ seq, ts: "t", src: "s", from, text });
@@ -114,14 +116,19 @@ test("ReactionQueue: one 📬 and one 👀 per seq, sequential, 👀 supersedes 
   assert.equal(q.enqueue(9, "👀"), false, "remembered from history");
 });
 
-test("resolveTargets: @names (incl. spaces), /re author, @all and @group mean anyone", () => {
+test("resolveTargets: @names (incl. spaces), /re author; only @all and known groups mean anyone", () => {
   const known = ["A", "B", "Pi Bot", "Pi", "H"];
+  const groups = ["reviewers"];
   assert.deepEqual(resolveTargets("@B please check", known, "A"), { names: ["B"], anyone: false });
   assert.deepEqual(resolveTargets("@Pi Bot and @B", known, "A"), { names: ["Pi Bot", "B"], anyone: false });
   assert.deepEqual(resolveTargets("@Pi only", known, "A"), { names: ["Pi"], anyone: false });
   assert.deepEqual(resolveTargets("@all status?", known, "A"), { names: [], anyone: true });
-  assert.deepEqual(resolveTargets("@reviewers look", known, "A"), { names: [], anyone: true });
-  assert.deepEqual(resolveTargets("@B and @reviewers", known, "A"), { names: ["B"], anyone: true });
+  assert.deepEqual(resolveTargets("@reviewers look", known, "A", undefined, groups), { names: [], anyone: true, groups: ["reviewers"] });
+  assert.deepEqual(resolveTargets("@B and @reviewers", known, "A", undefined, groups), { names: ["B"], anyone: true, groups: ["reviewers"] });
+  // An @tag that is neither a known name nor a known group: wait for that exact name, not for anyone.
+  assert.deepEqual(resolveTargets("@Carol can you help", known, "A"), { names: ["Carol"], anyone: false, unseen: ["Carol"] });
+  assert.deepEqual(resolveTargets("@reviewers look", known, "A"), { names: ["reviewers"], anyone: false, unseen: ["reviewers"] });
+  assert.deepEqual(resolveTargets("@ALL hands", known, "A"), { names: [], anyone: true });
   assert.deepEqual(resolveTargets("thanks", known, "A", "H"), { names: ["H"], anyone: false });
   assert.equal(resolveTargets("just chatting, mail b@B.com", known, "A"), null);
   assert.equal(resolveTargets("note to self @A", known, "A"), null);
@@ -222,4 +229,33 @@ test("profile: receipts and busyNoticeAfterSec", () => {
   assert.throws(() => validateProfile({ receipts: "yes" }), /receipts: must be true or false/);
   assert.throws(() => validateProfile({ busyNoticeAfterSec: -1 }), /busyNoticeAfterSec/);
   assert.throws(() => validateProfile({ busyNoticeAfterSec: true }), /busyNoticeAfterSec/);
+});
+
+test("ReceiptTracker: an unseen @name is waited for exactly; someone else's receipt doesn't satisfy it", () => {
+  let t = 1000;
+  const tr = new ReceiptTracker(200, () => t);
+  tr.noteOwn(5, "@Carol help", resolveTargets("@Carol help", ["A", "B"], "A"));
+  t = 1500;
+  tr.noteReaction("B", 5, "📬");
+  const rec = tr.get(5)!;
+  assert.equal(ReceiptTracker.satisfied(rec, "received"), false);
+  assert.match(describeReceipts(rec), /waiting for exact name Carol \(not seen in this channel yet\)/);
+  tr.noteReaction("Carol", 5, "📬");
+  assert.equal(ReceiptTracker.satisfied(tr.get(5)!, "received"), true);
+});
+
+test("describeReceipts says when any group member counts", () => {
+  const tr = new ReceiptTracker(200, () => 0);
+  tr.noteOwn(6, "@reviewers look", resolveTargets("@reviewers look", ["A"], "A", undefined, ["reviewers"]));
+  assert.match(describeReceipts(tr.get(6)!), /any member of @reviewers counts/);
+});
+
+test("acks: non-waking text, parseable, counted as receipt chatter", () => {
+  const t = ackText("⚡", "B", "interrupted (was running bash, 6m) — handling it", { seq: 41, from: "@A" });
+  assert.equal(t, "⚡ B interrupted (was running bash, 6m) — handling it (#41 from A)");
+  assert.doesNotMatch(t, /@|^\/re /);
+  assert.deepEqual(parseAck(t), { kind: "⚡", name: "B", seq: 41, from: "A" });
+  assert.equal(isReceiptChatter(t), true);
+  assert.equal(isReceiptChatter(ackText("⏹", "B", "stopped (running work aborted)", { seq: 2, from: "H" })), true);
+  assert.equal(isReceiptChatter("⚡ big news everyone"), false);
 });

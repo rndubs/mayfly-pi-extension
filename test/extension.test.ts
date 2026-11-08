@@ -192,7 +192,7 @@ describe("extension wiring against a local Mayfly server", { skip }, () => {
     assert.match(P.wakes()[1].m.content, /task 1/);
     assert.equal(P.stops().length, 0);
     const hist = await h.history(10);
-    assert.ok(hist.some((m) => m.from === "A" && /⛔ ignoring \/stop from "H"/.test(m.text)));
+    assert.ok(hist.some((m) => m.from === "A" && /^⛔ A is ignoring it — that sender is not allowed to stop \(#\d+ from H\)$/.test(m.text)));
   });
 
   test("an allowed /stop still cancels the pending wake", async () => {
@@ -337,7 +337,9 @@ describe("extension wiring against a local Mayfly server", { skip }, () => {
     assert.match(rc, /📬 B after/);
     // Nobody running: no 📬 at all.
     const res3 = await A.call("mayfly_post", { text: "@Ghost hello?", waitFor: "received", timeoutSec: 1 });
-    assert.match(res3.content[0].text, /no 📬 within 1s — the recipient may not be running/);
+    // @Ghost has never posted: we wait for that exact name (not anyone), and say so.
+    assert.match(res3.content[0].text, /no 📬 within 1s from Ghost — the recipient may not be running/);
+    assert.match(res3.content[0].text, /waiting for exact name Ghost \(not seen in this channel yet\)/);
   });
 
   test("busy notice: posted once per sender while one tool call runs past the threshold", async () => {
@@ -394,7 +396,7 @@ describe("extension wiring against a local Mayfly server", { skip }, () => {
       if (hist.some((m) => m.text.includes("⚡")) && reactsBy(hist, "A", r.id!, "👀")) break;
       await sleep(100);
     }
-    assert.ok(hist.some((m) => m.from === "A" && new RegExp(`^/re ${r.id} ⚡ A interrupted \\(was running bash, \\d+s\\) — handling #${r.id}$`).test(m.text)), JSON.stringify(hist));
+    assert.ok(hist.some((m) => m.from === "A" && new RegExp(`^⚡ A interrupted \\(was running bash, \\d+s\\) — handling it \\(#${r.id} from H\\)$`).test(m.text)), JSON.stringify(hist));
     assert.equal(reactsBy(hist, "A", r.id!, "👀"), 1);
     assert.equal(P.stops().length, 0);
   });
@@ -426,8 +428,8 @@ describe("extension wiring against a local Mayfly server", { skip }, () => {
     assert.match(w.m.content, /two \(held\)/);
     const hist = await h.history(20);
     assert.ok(hist.some((m) => m.from === "S" && m.text === '/interrupt "Pi Bot" urgent: check prod'));
-    for (let i = 0; i < 30 && !(await h.history(20)).some((m) => /⚡ Pi Bot was idle — handling #/.test(m.text)); i++) await sleep(100);
-    assert.ok((await h.history(20)).some((m) => /⚡ Pi Bot was idle — handling #/.test(m.text)));
+    for (let i = 0; i < 30 && !(await h.history(20)).some((m) => /^⚡ Pi Bot was idle — handling it \(#\d+ from /.test(m.text)); i++) await sleep(100);
+    assert.ok((await h.history(20)).some((m) => /^⚡ Pi Bot was idle — handling it \(#\d+ from /.test(m.text)));
   });
 
   test("a disallowed /interrupt doesn't abort or cancel a pending (throttled) wake", async () => {
@@ -448,7 +450,7 @@ describe("extension wiring against a local Mayfly server", { skip }, () => {
     assert.match(P.wakes()[1].m.content, /task 1/);
     assert.doesNotMatch(P.wakes()[1].m.content, /interrupted your current work/);
     const hist = await h.history(20);
-    assert.ok(hist.some((m) => m.from === "A" && /⛔ ignoring \/interrupt from "H" — not allowed to interrupt A/.test(m.text)));
+    assert.ok(hist.some((m) => m.from === "A" && /^⛔ A is ignoring it — that sender is not allowed to interrupt \(#\d+ from H\)$/.test(m.text)));
     assert.equal(reactsBy(hist, "A", hist.find((m) => m.text.startsWith("/interrupt"))!.seq, "📬"), 0, "no receipt for a disallowed interrupt");
   });
 

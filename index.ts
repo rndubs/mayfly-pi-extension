@@ -24,7 +24,7 @@ import {
   type PostResult,
 } from "./mayfly-core.js";
 import { addressedReason, Inbox, stopTargetsMe, type WakeAction } from "./policy.js";
-import {
+import { ackText,
   BusyTracker,
   describeReceipts,
   formatDuration,
@@ -40,7 +40,7 @@ import {
   resolveTargets,
   SEEN,
 } from "./receipts.js";
-import { browserCommand, introMessage, osc8, splitTaskArg, statusLabel, taskUpdateMessage } from "./presence.js";
+import { parseIntro, browserCommand, introMessage, osc8, splitTaskArg, statusLabel, taskUpdateMessage } from "./presence.js";
 import {
   type AllowStop,
   loadProfileFile,
@@ -125,6 +125,8 @@ export default function mayflyExtension(pi: ExtensionAPI) {
   let reactions: ReactionQueue | null = null;
   /** Names seen in the channel, for resolving whom our posts address. */
   const participants = new Set<string>();
+  /** Group tags other agents announced in their join intros (for receipt targets: @group means any member). */
+  const knownGroups = new Set<string>();
   /** seq → author, for "/re N" targets. */
   const authors = new Map<number, string>();
   /** Addressed seqs our watcher received this session (they get 👀 once the model sees them). */
@@ -179,9 +181,8 @@ export default function mayflyExtension(pi: ExtensionAPI) {
       },
       { triggerTurn: false },
     );
-    void bgPost(wasBusy ? `⏹ ${ch.name} stopped (running work aborted).` : `⏹ ${ch.name} was idle — nothing to stop.`, {
-      replyTo: m.seq,
-    });
+    // Acks are plain text (no /re, no @), so they wake nobody; the sender has receipts for delivery.
+    void bgPost(ackText("⏹", ch.name, wasBusy ? "stopped (running work aborted)" : "was idle — nothing to stop", m));
   }
 
   /**
@@ -211,9 +212,7 @@ export default function mayflyExtension(pi: ExtensionAPI) {
       inject(inbox.attemptUrgent(header(), m, note));
       refreshStatus();
       const tool = running ? `${running.name}, ${formatDuration(running.runningMs)}` : "a turn";
-      void bgPost(wasBusy ? `⚡ ${ch.name} interrupted (was running ${tool}) — handling #${m.seq}` : `⚡ ${ch.name} was idle — handling #${m.seq}`, {
-        replyTo: m.seq,
-      });
+      void bgPost(ackText("⚡", ch.name, wasBusy ? `interrupted (was running ${tool}) — handling it` : "was idle — handling it", m));
     } finally {
       urgent = Math.max(0, urgent - 1);
       if (!urgent && inbox?.wantsWake()) schedule(COALESCE_MS);
@@ -277,8 +276,11 @@ export default function mayflyExtension(pi: ExtensionAPI) {
       if (r && !r.un && ch.ownSeqs.has(r.seq)) receipts.noteReaction(m.from, r.seq, r.emoji);
       const b = parseBusyNotice(m.text);
       if (b && ch.ownSeqs.has(b.seq)) receipts.noteBusy(m.from, b.seq, b.tool, b.running);
+      const intro = parseIntro(m.text);
+      if (intro && intro.name === m.from) for (const g of intro.groups) knownGroups.add(g);
     }
     bound(participants, 500);
+    bound(knownGroups, 500);
     bound(authors, 2000);
   }
 
@@ -464,7 +466,7 @@ export default function mayflyExtension(pi: ExtensionAPI) {
           continue;
         }
         // Same as a disallowed /stop: say so, record it as an ordinary message, keep pending wakes.
-        void bgPost(`⛔ ignoring /interrupt from "${m.from || "?"}" — not allowed to interrupt ${channel.name}`, { replyTo: m.seq });
+        void bgPost(ackText("⛔", channel.name, "is ignoring it — that sender is not allowed to interrupt", m));
       }
       const sm = parseStop(m.text);
       if (sm && stopTargetsMe(sm.target, channel.name, profile().groups)) {
@@ -475,7 +477,7 @@ export default function mayflyExtension(pi: ExtensionAPI) {
         }
         // Not allowed: say so, and treat it as an ordinary (recorded, non-waking) message. It must not
         // cancel a pending wake.
-        void bgPost(`⛔ ignoring /stop from "${m.from || "?"}" — not allowed to stop ${channel.name}`, { replyTo: m.seq });
+        void bgPost(ackText("⛔", channel.name, "is ignoring it — that sender is not allowed to stop", m));
       }
       rest.push(m);
     }
@@ -585,6 +587,7 @@ export default function mayflyExtension(pi: ExtensionAPI) {
     inbox = new Inbox(config.profile!, { name: ch.name, ownSeqs: ch.ownSeqs });
     receipts = new ReceiptTracker(200);
     participants.clear();
+    knownGroups.clear();
     authors.clear();
     receivedAddressed.clear();
     reactions = new ReactionQueue(async (seq, emoji) => (await bgPost("", undefined, { seq, emoji }))?.posted === true);
@@ -1075,7 +1078,13 @@ export default function mayflyExtension(pi: ExtensionAPI) {
         const res = await toolPost(params.text, { replyTo: params.replyTo });
         const parts: string[] = [];
         if (res.posted === true && typeof res.id === "number") {
-          const targets = resolveTargets(params.text, participants, ch.name, params.replyTo !== undefined ? authors.get(params.replyTo) : undefined);
+          const targets = resolveTargets(
+            params.text,
+            participants,
+            ch.name,
+            params.replyTo !== undefined ? authors.get(params.replyTo) : undefined,
+            [...knownGroups, ...profile().groups],
+          );
           receipts.noteOwn(res.id, params.text, targets, postedAt);
         }
         observeShown(res.newMessages);
@@ -1122,7 +1131,7 @@ export default function mayflyExtension(pi: ExtensionAPI) {
         observeShown(res.newMessages);
         const msg =
           res.posted === true
-            ? `Stop request sent to ${target} as #${res.id}. It will acknowledge with a ⏹ message.`
+            ? `Stop request sent to ${target} as #${res.id}. It will acknowledge with a ⏹ message (non-waking); see mayfly_receipts ${res.id}.`
             : res.conflict
               ? "Conflict: new messages arrived first; stop NOT sent. Review them and retry if still needed."
               : `Stop request not sent: ${res.error ?? "error"}.`;
@@ -1159,7 +1168,7 @@ export default function mayflyExtension(pi: ExtensionAPI) {
         if (res.posted === true && typeof res.id === "number") receipts.noteOwn(res.id, `/interrupt ${target} ${message}`, null);
         const msg =
           res.posted === true
-            ? `Interrupt sent to ${target} as #${res.id}. It will acknowledge with a ⚡ reply (or ⛔ if not allowed); see mayfly_receipts ${res.id}.`
+            ? `Interrupt sent to ${target} as #${res.id}. It will acknowledge with a ⚡ message (or ⛔ if not allowed), which does not wake you; see mayfly_receipts ${res.id}.`
             : res.conflict
               ? "Conflict: new messages arrived first; interrupt NOT sent. Review them and retry if still needed."
               : `Interrupt not sent: ${res.error ?? "error"}.`;

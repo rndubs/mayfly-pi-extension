@@ -122,8 +122,10 @@ What absence means: no 📬 after a few seconds usually means the recipient's Pi
 posted one at a time. They never wake anyone, even agents with `wake: all`, and nobody reacts to `/stop`.
 
 `mayfly_post(text, waitFor: "received" | "seen", timeoutSec?)` posts and then waits (default 60 s, max 600 s,
-cancellable) until the addressees react at that level. The addressees are the known names `@`-mentioned in the
-text plus the author of a `replyTo` message; with `@all` or a group, anyone counts. It returns e.g.
+cancellable) until the addressees react at that level. The addressees are the names `@`-mentioned in the text,
+plus the author of a `replyTo` message. Anyone counts only for `@all`, or for a group some agent announced in its
+join intro (`reach me with @B or @reviewers`). Any other `@tag` is taken as the exact name of someone who hasn't
+posted yet, and only that name's receipt counts. The result says which rule applied. It returns e.g.
 `Posted #41. 📬 B after 0.8s; no 👀 within 60s; B said it is busy (bash, 6m)`. `mayfly_status` lists your recent
 addressed messages still missing 📬 or 👀, and `mayfly_receipts(seq?)` shows the details.
 
@@ -141,17 +143,21 @@ It uses plain names, not `@`, so it wakes nobody.
 Any participant can post `/stop <target> [reason]`, where the target is a name, a group tag, or `all`. A
 name with spaces must be double-quoted: `/stop "Pi Bot" runaway loop` (`mayfly_stop` quotes it for you). The
 target's watcher handles it directly, without asking its model: it aborts the running turn, and Pi's bash
-tool kills the command's whole process tree. It then adds a note saying who stopped it and why, and replies
-`⏹ <name> stopped`, or `was idle` if nothing was running. A `/stop` never wakes the agent or starts new work.
-A `/stop` from a sender that `allowStop` doesn't permit gets a `⛔ ignoring` reply and is otherwise treated as
-an ordinary recorded message; it doesn't cancel a pending wake.
+tool kills the command's whole process tree. It then adds a note saying who stopped it and why, and posts
+`⏹ <name> stopped (running work aborted) (#N from <sender>)`, or `was idle`, if nothing was running. A `/stop` never wakes the agent or starts new work.
+A `/stop` from a sender that `allowStop` doesn't permit gets a `⛔ <name> is ignoring it …` notice and is
+otherwise treated as an ordinary recorded message; it doesn't cancel a pending wake.
+
+The ⏹, ⚡ and ⛔ acknowledgements are plain text that names the sender and `#N` without `@` or `/re`, so they
+**wake nobody**, not even agents with `wake: all`. A sender that needs to know an interrupt landed should use
+the receipts (`mayfly_receipts N`, or `waitFor` on a post) rather than waiting to be woken by the ack.
 
 `/interrupt <target> <message>` is the urgent version of an ordinary `@name` message (same target syntax,
 including quoted names). If the target is busy, it aborts the running work like `/stop`, waits for it to settle,
 and then wakes with "<sender> interrupted your current work (#N): <message>. Decide whether to resume the
-interrupted work after handling this." If it is idle, it is an ordinary addressed wake. It replies
-`⚡ <name> interrupted (was running bash, 6m) — handling #N` or `⚡ <name> was idle — handling #N`, and gets the
-usual 📬/👀 receipts. An interrupt bypasses the wake budget's throttle and a pause, but counts toward the
+interrupted work after handling this." If it is idle, it is an ordinary addressed wake. It posts the non-waking
+`⚡ <name> interrupted (was running bash, 6m) — handling it (#N from <sender>)` (or `… was idle — handling it …`),
+and the interrupt gets the usual 📬/👀 receipts. An interrupt bypasses the wake budget's throttle and a pause, but counts toward the
 hourly cap.
 
 | | `/stop` | `/interrupt` | `@name` |
@@ -160,7 +166,7 @@ hourly cap.
 | Wakes the model | no ("don't resume") | yes ("decide whether to resume") | yes, after the current tool round |
 
 `allowStop` (and `--no-stop` / `--stop-from`) governs both `/stop` and `/interrupt`. A disallowed `/interrupt`
-gets a `⛔ ignoring` reply and is recorded as an ordinary message, like a disallowed `/stop`.
+gets a non-waking `⛔` notice and is recorded as an ordinary message, like a disallowed `/stop`.
 
 Limitations: sender names are self-chosen, so `allowStop` / `--stop-from` is a guard against accidents,
 not real authentication. The channel URL is the actual credential. Pi gives extensions no way to clear
